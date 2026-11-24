@@ -12,15 +12,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 不用第三方 theos-action（它 cd theos/sdks 会因新版 Theos 无此目录而失败）
+      # Theos 自带 sdks 子模块（--recurse-submodules 已包含），不要重复 clone
       - name: Setup Theos
         run: |
           git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/theos/theos.git theos
           echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
-
-      - name: Setup iOS SDK
-        run: |
-          git clone --depth 1 https://github.com/theos/sdks.git "$GITHUB_WORKSPACE/theos/sdks"
+          echo "SDK dirs:" && ls theos/sdks | head
 
       - name: Build dylib
         run: |
