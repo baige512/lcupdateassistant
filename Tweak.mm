@@ -281,8 +281,7 @@ static void LCShowUnlockDialog(void) {
 
 // ============ 常驻悬浮设置按钮 ============
 static UIView *lcFloatButton = nil;
-static NSString *const kButtonHiddenKey = @"lcua_float_hidden";
-static NSString *const kButtonXKey = @"lcua_btn_x";
+
 static NSString *const kButtonYKey = @"lcua_btn_y";   // 相对屏幕高度比例 0~1
 
 static void LCShowSettingsMenu(void);
