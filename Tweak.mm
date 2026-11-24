@@ -1,25 +1,24 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <CommonCrypto/CommonDigest.h>
 
 /*
- * LCUpdateAssistant · LiveContainer 软件源辅助 (v1.2 解锁版)
+ * LCUpdateAssistant · LiveContainer 软件源辅助
  *
  * 功能：
- *   1. App 回前台静默查源，发现新版本弹窗提示 + 复制/打开源地址
- *   2. 摇一摇呼出「卡密解锁」窗口，输入卡密 + UDID，直接调 api.php?action=activate 激活
- *   3. 激活成功后自动记录 UDID，方便下次预填，并给出带 udid 的专属源地址
- *
- * 为什么要摇一摇：
- *   guest App 里没法加按钮，也没法可靠唤起外部 App；摇一摇是 UIResponder 原生事件，
- *   不干扰正常操作，随时能呼出解锁框。
+ *   1. 「源」页顶部常驻蓝色按钮「激活软件源」，点开设置菜单
+ *   2. 摇一摇 / 菜单呼出「卡密解锁」，卡密或 UDID 二选一，直接调 api.php 激活/验证
+ *   3. 解锁成功后自动把「带 UDID 的专属源」导入 LiveContainer 软件源列表，不用手动添加
+ *   4. 回前台静默查源，本机版本落后时提示（不再提供无效的「立即检查更新」入口）
  *
  * 硬限制（写在前面，别踩坑）：
  *   iOS 普通 App 拿不到真机 UDID，identifierForVendor 跟后台设备表对不上。
  *   所以 UDID 必须用户从描述文件获取后手输/粘贴，插件不假装能自动拿。
  *
- * v1.2 相对 v1.1：新增摇一摇解锁；apiURL/apiKey 配置；激活结果直接显示。
- * v1.1 修复：observer 强引用；key 按 App 分开；去掉 canOpenURL；首次提示；弹窗重试。
+ * v1.9：按钮改蓝色；去掉「诊断软件源」「立即检查更新」；解锁成功自动导入专属源
+ *       （写 LCAltStoreSourceURLs + 预置缓存 + livecontainer://source 深链即时生效）。
+ * v1.8：去掉无用弹窗；模块页双击恢复被隐藏的按钮。
  */
 
 // -------- 可改配置（改完 make 一次）--------
@@ -114,6 +113,20 @@ static void LCShowAlert(NSString *title, NSString *msg, NSArray *actions) {
 
 static void LCCopy(NSString *text) {
     if (text.length) [UIPasteboard generalPasteboard].string = text;
+}
+
+// 给源地址拼上 udid（专属源）
+static NSString *LCSourceURLWithUDID(NSString *udid) {
+    NSString *src = LCSourceURL();
+    if (udid.length == 0) return src;
+    return ([src rangeOfString:@"?"].location == NSNotFound)
+        ? [src stringByAppendingFormat:@"?udid=%@", LCURLEncode(udid)]
+        : [src stringByAppendingFormat:@"&udid=%@", LCURLEncode(udid)];
+}
+
+static NSString *LCStripQuery(NSString *u) {
+    NSRange r = [u rangeOfString:@"?"];
+    return r.location == NSNotFound ? u : [u substringToIndex:r.location];
 }
 
 static NSComparisonResult LCCompareVersion(NSString *a, NSString *b) {
@@ -212,15 +225,94 @@ static void LCAPICall(NSString *action, NSDictionary *params, void (^done)(NSDic
     }] resume];
 }
 
-// 解锁成功后的统一提示：记 UDID + 给带 udid 的专属源
+// ============ 自动导入专属源到 LiveContainer 软件源 ============
+// LiveContainer 的源列表存在 UserDefaults 的 LCAltStoreSourceURLs（字符串数组），
+// 拉到的源 JSON 缓存在 Caches/AltStoreSourceCache/<sha256(源地址)>.json。
+// 官方还支持深链 livecontainer://source?url=xxx，走的就是「+ 添加源」那条路，能立即刷新 UI。
+static BOOL LCIsLiveContainerApp(void);   // 前置声明（定义在后文）
+
+static NSString *LCSHA256Hex(NSString *s) {
+    NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+    if (!d) return @"";
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(d.bytes, (CC_LONG)d.length, digest);
+    NSMutableString *out = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [out appendFormat:@"%02x", digest[i]];
+    return out;
+}
+
+// 把专属源写进 LiveContainer 的源列表；同域名的旧地址（无 udid / 旧 udid）顺手替换掉
+static BOOL LCImportSourceToDefaults(NSString *udidSrc, BOOL *existedBefore) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    id stored = [ud arrayForKey:@"LCAltStoreSourceURLs"];
+    NSArray *old = [stored isKindOfClass:[NSArray class]] ? (NSArray *)stored : @[];
+    if (existedBefore) *existedBefore = [old containsObject:udidSrc];
+
+    NSString *base = LCStripQuery(LCSourceURL());
+    NSMutableArray *list = [NSMutableArray array];
+    for (id it in old) {
+        if (![it isKindOfClass:[NSString class]]) continue;
+        NSString *s = (NSString *)it;
+        if ([LCStripQuery(s) isEqualToString:base]) continue;   // 同一源的旧地址，换成新的
+        [list addObject:s];
+    }
+    if (![list containsObject:udidSrc]) [list addObject:udidSrc];
+    [ud setObject:list forKey:@"LCAltStoreSourceURLs"];
+    [ud synchronize];
+    return YES;
+}
+
+// 预置源缓存：即使深链没走通，下次进「源」页也能直接把 App 列出来
+static void LCWarmSourceCache(NSString *src) {
+    NSURL *url = [NSURL URLWithString:src];
+    if (!url) return;
+    NSString *fileName = [LCSHA256Hex(src) stringByAppendingString:@".json"];
+    [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if (err || data.length < 32) return;
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSURL *caches = [[fm URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask] firstObject];
+        if (!caches) return;
+        NSURL *dir = [caches URLByAppendingPathComponent:@"AltStoreSourceCache" isDirectory:YES];
+        if (![fm fileExistsAtPath:dir.path]) {
+            [fm createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+        [data writeToURL:[dir URLByAppendingPathComponent:fileName] atomically:YES];
+    }] resume];
+}
+
+// 深链让「源」页当场把新源加载出来（等价于点 + 手动粘贴地址）
+static void LCOpenSourceDeepLink(NSString *udidSrc) {
+    NSString *s = [NSString stringWithFormat:@"livecontainer://source?url=%@", LCURLEncode(udidSrc)];
+    NSURL *url = [NSURL URLWithString:s];
+    if (!url) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+    });
+}
+
+// 解锁成功后的统一提示：记 UDID + 自动导入专属源
 static void LCUnlockSuccess(NSString *udid, NSString *message) {
     [[NSUserDefaults standardUserDefaults] setObject:udid forKey:@"lcua_last_udid"];
     [[NSUserDefaults standardUserDefaults] synchronize];
-    NSString *src = LCSourceURL();
-    NSString *udidSrc = ([src rangeOfString:@"?"].location == NSNotFound)
-        ? [src stringByAppendingFormat:@"?udid=%@", LCURLEncode(udid)]
-        : [src stringByAppendingFormat:@"&udid=%@", LCURLEncode(udid)];
-    NSString *msg = [NSString stringWithFormat:@"%@\n\n专属源地址（已带 UDID）：\n%@\n\n请回 LiveContainer 添加/刷新这个源，付费 App 就会出现。", message, udidSrc];
+    NSString *udidSrc = LCSourceURLWithUDID(udid);
+
+    BOOL isLC = LCIsLiveContainerApp();
+    BOOL existed = NO;
+    if (isLC) {
+        LCImportSourceToDefaults(udidSrc, &existed);
+        LCWarmSourceCache(udidSrc);
+        if (!existed) LCOpenSourceDeepLink(udidSrc);
+    }
+
+    NSString *tail;
+    if (!isLC) {
+        tail = @"当前不在 LiveContainer 本体里，请到「源」页右上角手动添加这个地址：";
+    } else if (existed) {
+        tail = @"这个源已经在「软件源」列表里了，切到「源」页下拉刷新即可。";
+    } else {
+        tail = @"已自动导入到「软件源」，切到「源」页就能看到付费 App。\n若列表没变，重启一次 LiveContainer 即可。";
+    }
+    NSString *msg = [NSString stringWithFormat:@"%@\n\n专属源地址（已带 UDID）：\n%@\n\n%@", message, udidSrc, tail];
     LCShowAlert(@"解锁成功", msg, @[
         [UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil],
         [UIAlertAction actionWithTitle:@"复制专属源地址" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { LCCopy(udidSrc); }]
@@ -339,7 +431,8 @@ static void LCShowSettingsMenu(void);
     if (!self) return nil;
     self.layer.cornerRadius = frame.size.height / 2;
     self.layer.masksToBounds = YES;
-    self.backgroundColor = [UIColor colorWithRed:0.36 green:0.24 blue:0.72 alpha:0.92];
+    // 蓝色（#0A7AFA），跟系统强调色一致
+    self.backgroundColor = [UIColor colorWithRed:0.04 green:0.48 blue:0.98 alpha:0.95];
     self.layer.shadowColor = [UIColor blackColor].CGColor;
     self.layer.shadowOpacity = 0.28;
     self.layer.shadowRadius = 5;
@@ -406,60 +499,6 @@ static BOOL LCIsOnSourcesTab(void) {
     UITabBarController *tab = LCFindTabBar(win.rootViewController);
     if (!tab) return NO;
     return tab.selectedIndex == 0;
-}
-
-// -------- 诊断：拉专属源，解读 deviceState / 描述 / 应用数 --------
-static void LCDiagnoseSource(void) {
-    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_last_udid"] ?: @"";
-    NSString *src = LCSourceURL();
-    if (saved.length) {
-        src = ([src rangeOfString:@"?"].location == NSNotFound)
-            ? [src stringByAppendingFormat:@"?udid=%@", LCURLEncode(saved)]
-            : [src stringByAppendingFormat:@"&udid=%@", LCURLEncode(saved)];
-    }
-    NSURL *url = [NSURL URLWithString:src];
-    if (!url) { LCShowAlert(@"诊断失败", @"源地址无效", @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]); return; }
-
-    [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *err) {
-        if (err) { LCShowAlert(@"诊断失败", err.localizedDescription, @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]); return; }
-        NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
-        NSString *state = http ? ([http.allHeaderFields objectForKey:@"X-AltStore-Device-State"] ?: @"(无)") : @"(无)";
-        NSString *unlocked = http ? ([http.allHeaderFields objectForKey:@"X-AltStore-Unlocked"] ?: @"?") : @"?";
-        NSString *bindReason = http ? ([http.allHeaderFields objectForKey:@"X-AltStore-Bind-Reason"] ?: @"") : @"";
-
-        NSString *desc = @"";
-        NSInteger appCount = -1;
-        NSError *je = nil;
-        id obj = [NSJSONSerialization JSONObjectWithData:data ?: [NSData data] options:0 error:&je];
-        if (!je && [obj isKindOfClass:[NSDictionary class]]) {
-            desc = [obj objectForKey:@"description"] ?: @"";
-            NSArray *apps = [obj objectForKey:@"apps"];
-            if ([apps isKindOfClass:[NSArray class]]) appCount = (NSInteger)apps.count;
-        }
-
-        NSString *statusLine = [NSString stringWithFormat:@"HTTP %ld · 解锁头=%@ · 设备状态=%@ · 应用数=%ld",
-            (long)(http ? http.statusCode : 0), unlocked, state, (long)appCount];
-        NSString *advice = @"";
-        if ([state isEqualToString:@"foreign"] || [bindReason isEqualToString:@"ip"]) {
-            advice = @"\n\n【付费应用不出的原因】当前网络与首次绑定网络不一致：\n1) 用手机 Safari 打开一次 https://app.baqu.net 首页；\n2) 回 LiveContainer 下拉刷新专属源；\n3) 仍不行到后台「设备管理→详情」解绑后刷新。";
-        } else if ([state isEqualToString:@"expired"]) {
-            advice = @"\n\n授权已过期，续期后刷新自动恢复付费应用。";
-        } else if ([state isEqualToString:@"disabled"] || [state isEqualToString:@"blacklisted"]) {
-            advice = @"\n\n设备被禁用/拉黑，联系管理员处理。";
-        } else if ([state isEqualToString:@"not_found"] || [state isEqualToString:@"invalid"]) {
-            advice = @"\n\n设备未激活或 UDID 不对，先在插件里解锁。";
-        } else if ([state isEqualToString:@"ok"]) {
-            advice = @"\n\n设备状态正常。若仍只有免费应用，确认你添加的是「带 UDID 的专属源地址」而不是不带参数的普通源。";
-        } else {
-            advice = @"\n\n未拿到设备状态——很可能添加的是不带 UDID 的普通源。请用菜单里「复制专属源地址（带 UDID）」重新添加。";
-        }
-        NSString *msg = [NSString stringWithFormat:@"%@\n\n源描述：%@%@", statusLine,
-            desc.length > 120 ? [desc substringToIndex:120] : (desc.length ? desc : @"(无)"), advice];
-        LCShowAlert(@"软件源诊断", msg, @[
-            [UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil],
-            [UIAlertAction actionWithTitle:@"复制诊断信息" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { LCCopy(msg); }]
-        ]);
-    }] resume];
 }
 
 static UIView *LCMakeFloatButton(void) {
@@ -545,12 +584,7 @@ static void LCAttachFloatButton(void) {
 static void LCShowSettingsMenu(void) {
     NSString *src = LCSourceURL();
     NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_last_udid"] ?: @"";
-    NSString *u = src;
-    if (saved.length) {
-        u = ([src rangeOfString:@"?"].location == NSNotFound)
-            ? [src stringByAppendingFormat:@"?udid=%@", LCURLEncode(saved)]
-            : [src stringByAppendingFormat:@"&udid=%@", LCURLEncode(saved)];
-    }
+    NSString *u = LCSourceURLWithUDID(saved);
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"激活软件源"
         message:[NSString stringWithFormat:@"源：%@\nUDID：%@", src, saved.length ? saved : @"未记录"]
         preferredStyle:UIAlertControllerStyleActionSheet];
@@ -558,15 +592,23 @@ static void LCShowSettingsMenu(void) {
     [sheet addAction:[UIAlertAction actionWithTitle:@"卡密解锁（卡密或 UDID 二选一）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         LCShowUnlockDialog();
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"导入专属源到软件源" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        if (saved.length == 0) {
+            LCShowAlert(@"还没解锁", @"先点「卡密解锁」激活一次，插件会记下 UDID，之后就能一键导入。",
+                @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
+            return;
+        }
+        BOOL existed = NO;
+        LCImportSourceToDefaults(u, &existed);
+        LCWarmSourceCache(u);
+        if (!existed) LCOpenSourceDeepLink(u);
+        LCShowAlert(@"已导入", existed
+            ? @"这个源已经在「软件源」列表里了，切到「源」页下拉刷新即可。"
+            : @"专属源已加进「软件源」，切到「源」页就能看到付费 App。\n若列表没变，重启一次 LiveContainer 即可。",
+            @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"复制专属源地址（带 UDID）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         LCCopy(u);
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"诊断软件源（查付费应用为何不显示）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        LCDiagnoseSource();
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"立即检查更新" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:LCKey(@"lcua_last_check")];
-        LCRunCheck();
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"隐藏此按钮" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
         LCHideFloatButton();
