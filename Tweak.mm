@@ -17,6 +17,8 @@
  *   iOS 普通 App 拿不到真机 UDID，identifierForVendor 跟后台设备表对不上。
  *   UDID 只能借 Safari 装一次描述文件拿，插件跳到站点 udid.php 用令牌换回来。
  *
+ * v2.2：修「解锁成功但付费应用不显示」——预置缓存改为先确认/完成网络改绑再落盘，
+ *       避免把只有免费应用的源写进 LiveContainer 缓存；解锁流程改为「先刷好缓存再跳源页」。
  * v2.1：去掉摇一摇解锁；解锁框加「获取 UDID」（Safari 装描述文件 → 回来自动填入）；
  *       拉源时读 X-AltStore-Device-State，换网络被拦（foreign/ip）自动打开首页改绑再重试。
  * v2.0：按钮/面板改名「八区软件源」；面板正文换成免责声明 + 设备 UID / 当前 IP / 会员到期 /
@@ -444,21 +446,31 @@ static BOOL LCImportSourceToDefaults(NSString *udidSrc, BOOL *existedBefore) {
 }
 
 // 预置源缓存：即使深链没走通，下次进「源」页也能直接把 App 列出来
-static void LCWarmSourceCache(NSString *src) {
+static void LCFetchSourceJSON(BOOL allowRebind, void (^done)(NSArray *apps, BOOL unlocked, NSString *state));  // 定义在下面
+
+// 预置源缓存：先确保当前网络已绑定（换网时 LCFetchSourceJSON 会自动改绑），再下载整份 JSON 落盘。
+// 关键：不这么做的话，换过网络的设备会把「只有免费应用」的那份写进缓存，
+// LiveContainer 一进源页看到的就是免费列表，看起来像「解锁没生效」。
+static void LCWarmSourceCache(NSString *src, void (^done)(void)) {
     NSURL *url = [NSURL URLWithString:src];
-    if (!url) return;
+    if (!url) { if (done) done(); return; }
     NSString *fileName = [LCSHA256Hex(src) stringByAppendingString:@".json"];
-    [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        if (err || data.length < 32) return;
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSURL *caches = [[fm URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask] firstObject];
-        if (!caches) return;
-        NSURL *dir = [caches URLByAppendingPathComponent:@"AltStoreSourceCache" isDirectory:YES];
-        if (![fm fileExistsAtPath:dir.path]) {
-            [fm createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        }
-        [data writeToURL:[dir URLByAppendingPathComponent:fileName] atomically:YES];
-    }] resume];
+    LCFetchSourceJSON(YES, ^(NSArray *apps, BOOL unlocked, NSString *state) {
+        [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            if (!err && data.length >= 32) {
+                NSFileManager *fm = [NSFileManager defaultManager];
+                NSURL *caches = [[fm URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask] firstObject];
+                if (caches) {
+                    NSURL *dir = [caches URLByAppendingPathComponent:@"AltStoreSourceCache" isDirectory:YES];
+                    if (![fm fileExistsAtPath:dir.path]) {
+                        [fm createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                    }
+                    [data writeToURL:[dir URLByAppendingPathComponent:fileName] atomically:YES];
+                }
+            }
+            if (done) done();
+        }] resume];
+    });
 }
 
 // 深链让「源」页当场把新源加载出来（等价于点 + 手动粘贴地址）
@@ -474,8 +486,6 @@ static void LCOpenSourceDeepLink(NSString *udidSrc) {
 // ---------- 专属源绑定：换网络被拦（foreign/ip）时自动改绑 ----------
 // 站点逻辑：设备第一次拉专属源 → 记下当时公网 IP 当 bind_ip；换网络后只有「先打开过站点首页」
 // （记录 touch_ip）再拉源才会重新绑定，否则只给免费应用。这里替用户把这一步自动做掉。
-static void LCFetchSourceJSON(BOOL allowRebind, void (^done)(NSArray *apps, BOOL unlocked, NSString *state));
-
 static void LCRebindCurrentNetwork(NSString *udid, void (^done)(void)) {
     NSString *s = [NSString stringWithFormat:@"%@/?udid=%@", LCSiteBase(), LCURLEncode(udid)];
     NSURL *u = [NSURL URLWithString:s];
@@ -536,7 +546,7 @@ static void LCRefreshStatsAsync(void) {
         if (unlocked) {
             // 改绑成功后把缓存刷成「含付费应用」的版本，下次进源页直接有
             NSString *u = [ud stringForKey:@"lcua_last_udid"] ?: @"";
-            LCWarmSourceCache(LCSourceURLWithUDID(u));
+            LCWarmSourceCache(LCSourceURLWithUDID(u), nil);
         }
     });
     LCFetchClientIP();
@@ -564,11 +574,7 @@ static void LCUnlockSuccess(NSString *udid, NSString *expire, NSString *note) {
 
     BOOL isLC = LCIsLiveContainerApp();
     BOOL existed = NO;
-    if (isLC) {
-        LCImportSourceToDefaults(udidSrc, &existed);
-        LCWarmSourceCache(udidSrc);
-        if (!existed) LCOpenSourceDeepLink(udidSrc);
-    }
+    if (isLC) LCImportSourceToDefaults(udidSrc, &existed);
 
     BOOL needCheck = isLC;
 
@@ -596,22 +602,35 @@ static void LCUnlockSuccess(NSString *udid, NSString *expire, NSString *note) {
                 @"或在后台「设备管理 → 详情」解绑本机后刷新。", LCSiteBase()];
         }
 
-        NSMutableArray *lines = [NSMutableArray array];
-        if (note.length) [lines addObject:note];
-        [lines addObject:[NSString stringWithFormat:@"UDID：%@", udid]];
-        if (expire.length) {
-            [lines addObject:[NSString stringWithFormat:@"到期：%@", expire]];
-            NSInteger left = LCDaysLeftOf(expire);
-            if (left >= 0) [lines addObject:[NSString stringWithFormat:@"剩余：%ld 天", (long)left]];
-        }
-        NSString *msg = [NSString stringWithFormat:@"%@\n\n%@", [lines componentsJoinedByString:@"\n"], tail];
-        LCShowAlert(@"解锁成功", msg, @[
-            [UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]
-        ]);
+        void (^showAlert)(void) = ^{
+            NSMutableArray *lines = [NSMutableArray array];
+            if (note.length) [lines addObject:note];
+            [lines addObject:[NSString stringWithFormat:@"UDID：%@", udid]];
+            if (expire.length) {
+                [lines addObject:[NSString stringWithFormat:@"到期：%@", expire]];
+                NSInteger left = LCDaysLeftOf(expire);
+                if (left >= 0) [lines addObject:[NSString stringWithFormat:@"剩余：%ld 天", (long)left]];
+            }
+            NSString *msg = [NSString stringWithFormat:@"%@\n\n%@", [lines componentsJoinedByString:@"\n"], tail];
+            LCShowAlert(@"解锁成功", msg, @[
+                [UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]
+            ]);
+        };
+
+        if (!isLC) { dispatch_async(dispatch_get_main_queue(), showAlert); return; }
+
+        // 先把缓存刷成「含付费应用」的版本，再跳源页，避免源页先读到旧的免费列表
+        LCWarmSourceCache(udidSrc, ^{
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!existed) LCOpenSourceDeepLink(udidSrc);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), showAlert);
+            });
+        });
     };
 
     if (needCheck) LCFetchSourceJSON(YES, finish);
-    else finish(nil, NO, @"");
+    else dispatch_async(dispatch_get_main_queue(), ^{ finish(nil, NO, @""); });
 
     // 顺手刷新面板要显示的 IP / 统计
     LCFetchClientIP();
@@ -1033,13 +1052,19 @@ static void LCShowSettingsMenu(void) {
         }
         BOOL existed = NO;
         LCImportSourceToDefaults(u, &existed);
-        LCWarmSourceCache(u);
-        if (!existed) LCOpenSourceDeepLink(u);
         LCRefreshStatsAsync();
-        LCShowAlert(@"已导入", existed
-            ? @"这个源已经在「软件源」列表里了，切到「源」页下拉刷新即可。"
-            : @"专属源已加进「软件源」，切到「源」页就能看到付费 App。\n若列表没变，重启一次 LiveContainer 即可。",
-            @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
+        LCWarmSourceCache(u, ^{
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!existed) LCOpenSourceDeepLink(u);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    LCShowAlert(@"已导入", existed
+                        ? @"这个源已经在「软件源」列表里了，切到「源」页下拉刷新即可。"
+                        : @"专属源已加进「软件源」，切到「源」页就能看到付费 App。\n若列表没变，重启一次 LiveContainer 即可。",
+                        @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
+                });
+            });
+        });
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"隐藏此按钮" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
         LCHideFloatButton();
