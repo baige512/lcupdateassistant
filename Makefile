@@ -7,13 +7,11 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = LCUpdateAssistant
 
-LCUpdateAssistant_FILES = Tweak.xm
+# 用纯 Objective-C++（Tweak.mm）+ 原生 runtime hook，
+# 不经过 Logos 预处理器、不依赖 CydiaSubstrate.framework ——
+# LiveContainer 里没有 CydiaSubstrate，默认 tweak 会报 "Library not loaded"。
+LCUpdateAssistant_FILES = Tweak.mm
 LCUpdateAssistant_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 LCUpdateAssistant_FRAMEWORKS = UIKit Foundation
-
-# 关键：用 Logos 的 Internal 生成器（method_exchangeImplementations），
-# 不依赖 CydiaSubstrate.framework —— LiveContainer 里没有这个库，
-# 默认 MobileSubstrate 生成器编出来的 dylib 会报 "Library not loaded: CydiaSubstrate"。
-LOGOS_DEFAULT_GENERATOR = Internal
 
 include $(THEOS_MAKE_PATH)/tweak.mk
