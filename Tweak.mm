@@ -362,6 +362,92 @@ static void LCShowSettingsMenu(void);
 - (void)lcTapped { if (self.onTap) self.onTap(); }
 @end
 
+// -------- 只在 LiveContainer 的「源」页显示按钮 --------
+// SwiftUI TabView 底层是 UITabBarController；"源"是第 0 个 tab。
+// 递归找 UITabBarController，判断 selectedIndex==0；同时确认当前是 LiveContainer 本体而非 guest App。
+static UITabBarController *LCFindTabBar(UIViewController *vc) {
+    if (!vc) return nil;
+    if ([vc isKindOfClass:[UITabBarController class]]) return (UITabBarController *)vc;
+    for (UIViewController *child in vc.childViewControllers) {
+        UITabBarController *t = LCFindTabBar(child);
+        if (t) return t;
+    }
+    if (vc.presentedViewController) {
+        UITabBarController *t = LCFindTabBar(vc.presentedViewController);
+        if (t) return t;
+    }
+    return nil;
+}
+
+static BOOL LCIsLiveContainerApp(void) {
+    NSString *bid = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleIdentifier"] ?: @"";
+    // LiveContainer 本体 bundle id: com.kdt.livecontainer（可能带 team 后缀）
+    // guest App 的 mainBundle 被替换成客制 App 的 id，不会命中这里
+    return [bid rangeOfString:@"livecontainer"].location != NSNotFound;
+}
+
+static BOOL LCIsOnSourcesTab(void) {
+    if (!LCIsLiveContainerApp()) return NO;
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    UITabBarController *tab = LCFindTabBar(win.rootViewController);
+    if (!tab) return NO;
+    return tab.selectedIndex == 0;
+}
+
+// -------- 诊断：拉专属源，解读 deviceState / 描述 / 应用数 --------
+static void LCDiagnoseSource(void) {
+    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_last_udid"] ?: @"";
+    NSString *src = LCSourceURL();
+    if (saved.length) {
+        src = ([src rangeOfString:@"?"].location == NSNotFound)
+            ? [src stringByAppendingFormat:@"?udid=%@", LCURLEncode(saved)]
+            : [src stringByAppendingFormat:@"&udid=%@", LCURLEncode(saved)];
+    }
+    NSURL *url = [NSURL URLWithString:src];
+    if (!url) { LCShowAlert(@"诊断失败", @"源地址无效", @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]); return; }
+
+    [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *err) {
+        if (err) { LCShowAlert(@"诊断失败", err.localizedDescription, @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]); return; }
+        NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+        NSString *state = http ? ([http.allHeaderFields objectForKey:@"X-AltStore-Device-State"] ?: @"(无)") : @"(无)";
+        NSString *unlocked = http ? ([http.allHeaderFields objectForKey:@"X-AltStore-Unlocked"] ?: @"?") : @"?";
+        NSString *bindReason = http ? ([http.allHeaderFields objectForKey:@"X-AltStore-Bind-Reason"] ?: @"") : @"";
+
+        NSString *desc = @"";
+        NSInteger appCount = -1;
+        NSError *je = nil;
+        id obj = [NSJSONSerialization JSONObjectWithData:data ?: [NSData data] options:0 error:&je];
+        if (!je && [obj isKindOfClass:[NSDictionary class]]) {
+            desc = [obj objectForKey:@"description"] ?: @"";
+            NSArray *apps = [obj objectForKey:@"apps"];
+            if ([apps isKindOfClass:[NSArray class]]) appCount = (NSInteger)apps.count;
+        }
+
+        NSString *statusLine = [NSString stringWithFormat:@"HTTP %ld · 解锁头=%@ · 设备状态=%@ · 应用数=%ld",
+            (long)(http ? http.statusCode : 0), unlocked, state, (long)appCount];
+        NSString *advice = @"";
+        if ([state isEqualToString:@"foreign"] || [bindReason isEqualToString:@"ip"]) {
+            advice = @"\n\n【付费应用不出的原因】当前网络与首次绑定网络不一致：\n1) 用手机 Safari 打开一次 https://app.baqu.net 首页；\n2) 回 LiveContainer 下拉刷新专属源；\n3) 仍不行到后台「设备管理→详情」解绑后刷新。";
+        } else if ([state isEqualToString:@"expired"]) {
+            advice = @"\n\n授权已过期，续期后刷新自动恢复付费应用。";
+        } else if ([state isEqualToString:@"disabled"] || [state isEqualToString:@"blacklisted"]) {
+            advice = @"\n\n设备被禁用/拉黑，联系管理员处理。";
+        } else if ([state isEqualToString:@"not_found"] || [state isEqualToString:@"invalid"]) {
+            advice = @"\n\n设备未激活或 UDID 不对，先在插件里解锁。";
+        } else if ([state isEqualToString:@"ok"]) {
+            advice = @"\n\n设备状态正常。若仍只有免费应用，确认你添加的是「带 UDID 的专属源地址」而不是不带参数的普通源。";
+        } else {
+            advice = @"\n\n未拿到设备状态——很可能添加的是不带 UDID 的普通源。请用菜单里「复制专属源地址（带 UDID）」重新添加。";
+        }
+        NSString *msg = [NSString stringWithFormat:@"%@\n\n源描述：%@%@", statusLine,
+            desc.length > 120 ? [desc substringToIndex:120] : (desc.length ? desc : @"(无)"), advice];
+        LCShowAlert(@"软件源诊断", msg, @[
+            [UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil],
+            [UIAlertAction actionWithTitle:@"复制诊断信息" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { LCCopy(msg); }]
+        ]);
+    }] resume];
+}
+
 static UIView *LCMakeFloatButton(void) {
     return [[LCFloatButtonView alloc] initWithFrame:CGRectMake(0, 0, 108, 36)];
 }
@@ -392,6 +478,12 @@ static void LCAttachFloatButton(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ LCAttachFloatButton(); });
         return;
     }
+    // 只在「源」tab 显示；其它页面/客制 App 里隐藏
+    BOOL onSources = LCIsOnSourcesTab();
+    if (!onSources) {
+        if (lcFloatButton) [lcFloatButton removeFromSuperview];
+        return;
+    }
     if (lcFloatButton && lcFloatButton.superview == win) { LCPositionButton(lcFloatButton); return; }
     if (!lcFloatButton) lcFloatButton = LCMakeFloatButton();
     [win addSubview:lcFloatButton];
@@ -417,6 +509,9 @@ static void LCShowSettingsMenu(void) {
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"复制专属源地址（带 UDID）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         LCCopy(u);
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"诊断软件源（查付费应用为何不显示）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        LCDiagnoseSource();
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"立即检查更新" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [[NSUserDefaults standardUserDefaults] removeObjectForKey:LCKey(@"lcua_last_check")];
@@ -483,5 +578,12 @@ __attribute__((constructor)) static void lcInit(void) {
                     LCRunCheck();
                 });
             }];
+        // 每 0.5 秒检查一次当前 tab，源页显示、其它页隐藏（SwiftUI TabView 切换无通知）
+        // 延迟到下一个 runloop，确保主线程 runloop 已就绪
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+                LCAttachFloatButton();
+            }];
+        });
     }
 }
