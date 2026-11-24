@@ -12,12 +12,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Theos 签名需要 ldid；GitHub macOS runner 默认没装
+      - name: Install ldid
+        run: brew install ldid
+
       # Theos 自带 sdks 子模块（--recurse-submodules 已包含），不要重复 clone
       - name: Setup Theos
         run: |
           git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/theos/theos.git theos
           echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
-          echo "SDK dirs:" && ls theos/sdks | head
 
       - name: Build dylib
         run: |
