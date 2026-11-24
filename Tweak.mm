@@ -31,6 +31,8 @@ static BOOL const kEnableFirstRunHint = YES;
 static BOOL const kEnableShakeUnlock  = YES;
 static BOOL const kEnableFloatButton  = YES;   // 常驻悬浮设置按钮
 static NSString *const kButtonHiddenKey = @"lcua_float_hidden";
+static NSString *const kButtonXKey = @"lcua_btn_x";
+static NSString *const kButtonYKey = @"lcua_btn_y";   // 相对屏幕高度比例 0~1
 // ------------------------------------------
 
 // observer 必须强引用持有
@@ -281,8 +283,6 @@ static void LCShowUnlockDialog(void) {
 
 // ============ 常驻悬浮设置按钮 ============
 static UIView *lcFloatButton = nil;
-
-static NSString *const kButtonYKey = @"lcua_btn_y";   // 相对屏幕高度比例 0~1
 
 static void LCShowSettingsMenu(void);
 
