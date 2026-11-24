@@ -34,6 +34,7 @@ static BOOL const kEnableFloatButton  = YES;   // 常驻悬浮设置按钮
 static NSString *const kButtonHiddenKey = @"lcua_float_hidden";
 static NSString *const kAppTitle        = @"八区软件源";   // 按钮 + 面板标题
 static NSString *const kQQGroup         = @"565911547";
+static NSString *const kBuyURL          = @"https://store.baqu.net/";   // 「购买软件源」跳这里
 // ------------------------------------------
 
 // observer 必须强引用持有
@@ -599,6 +600,10 @@ static void LCShowUnlockDialog(void) {
             tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
         }];
 
+        [alert addAction:[UIAlertAction actionWithTitle:@"去购买卡密" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            NSURL *buy = [NSURL URLWithString:kBuyURL];
+            if (buy) [[UIApplication sharedApplication] openURL:buy options:@{} completionHandler:nil];
+        }]];
         [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         [alert addAction:[UIAlertAction actionWithTitle:@"解锁" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             NSString *card = alert.textFields.count > 0 ? alert.textFields[0].text : @"";
@@ -790,6 +795,12 @@ static void LCShowSettingsMenu(void) {
         message:LCStatsMessage()
         preferredStyle:UIAlertControllerStyleActionSheet];
 
+    // 用 Safari 打开购买页（任务里直接开外面浏览器，不在 App 内嵌）
+    [sheet addAction:[UIAlertAction actionWithTitle:@"购买软件源" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NSURL *buy = [NSURL URLWithString:kBuyURL];
+        if (!buy) return;
+        [[UIApplication sharedApplication] openURL:buy options:@{} completionHandler:nil];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"卡密解锁（卡密或 UDID 二选一）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         LCShowUnlockDialog();
     }]];
