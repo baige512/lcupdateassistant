@@ -1,9 +1,10 @@
-# LCUpdateAssistant · LiveContainer 软件源辅助插件（v2.0）
+# LCUpdateAssistant · LiveContainer 软件源辅助插件（v2.2）
 
 一个 Theos tweak，装进 LiveContainer 后多出三个能力：
 
 1. **「源」页顶部常驻蓝色按钮「八区软件源」**，点开面板（只在源页显示，其它页面/客制 App 里自动隐藏）。面板正文是免责声明 + 设备 UID / 当前 IP / 会员到期 / 站内应用数 / 本次更新 / 数据刷新 / QQ 群；菜单第一项是「购买软件源」，点了直接用 Safari 打开 https://store.baqu.net/ 。
-2. **卡密解锁**：摇一摇或点按钮 → 卡密或 UDID 二选一 → 直接调后台 `api.php` 激活/验证。
+2. **卡密解锁**：点按钮 → 卡密或 UDID 二选一 → 直接调后台 `api.php` 激活/验证；框里可一键「获取本机 UDID」（跳 Safari 装描述文件，回来自动填入）。摇一摇入口已移除。
+3. **换网自动改绑**：拉源时读 `X-AltStore-Device-State`，发现 `foreign/ip`（换 Wi-Fi/蜂窝导致付费应用被拦）就先打开站点首页记录当前网络，再重拉一次源。
 3. **解锁后自动导入专属源**：成功那一刻就把「带 UDID 的源地址」写进 LiveContainer 的软件源列表并立即刷新，不用再手动复制粘贴。
 
 > 另外保留回前台静默查源、本机版本落后时提示的能力；原来那个点了没反应的「立即检查更新」入口已删除。
@@ -65,7 +66,6 @@ kDefaultSourceURL  源地址
 kDefaultAPIURL     激活接口 api.php
 kDefaultAPIKey     后台 API 密钥（后台没配就留空）
 kCheckInterval     检查间隔秒
-kEnableShakeUnlock 是否开启摇一摇解锁
 kEnableFloatButton 是否显示顶部按钮
 ```
 
@@ -78,6 +78,8 @@ kEnableFloatButton 是否显示顶部按钮
 
 ## 版本记录
 
+- **v2.2**：修「解锁成功但付费 App 不显示」：预置源缓存改为先确认当前网络绑定（必要时自动改绑）再落盘，避免把只有免费 App 的源写进 LiveContainer 缓存；解锁流程改成先刷好缓存再跳源页
+- **v2.1**：去掉摇一摇解锁；解锁框新增「获取本机 UDID（跳 Safari）」，装完描述文件回来自动填入；拉源时按 `X-AltStore-Device-State` 检测，换网络被拦（foreign/ip）会自动打开站点首页改绑再重试，解锁成功弹窗也会如实告知是否已放行付费应用
 - **v2.0**：面板新增「购买软件源」（Safari 打开 https://store.baqu.net/ ），卡密解锁弹窗也加了「去购买卡密」；按钮与面板改名「八区软件源」；面板正文换成免责声明 + 设备信息（UID / 当前 IP / 会员到期 / 应用数 / 本次更新 / 刷新时间 / QQ 群）；解锁成功弹窗把 UDID 提到到期时间上方，去掉源地址块与「复制专属源地址」按钮；菜单去掉「复制专属源地址（带 UDID）」
 - **v1.9**：按钮改蓝色（#0A7AFA）；删除「诊断软件源」和没起作用的「立即检查更新」；解锁/激活成功后**自动导入专属源到软件源**（写 `LCAltStoreSourceURLs` + 预置缓存 + `livecontainer://source` 深链），菜单新增「导入专属源到软件源」手动兜底
 - **v1.8**：去掉首次加载弹窗；收紧判定（用 lcMainBundle + 路径双重判断，客制 App 里彻底不显示）；隐藏按钮后可在「模块」页双击屏幕恢复显示
