@@ -1,6 +1,5 @@
 name: Build LCUpdateAssistant
 
-# 有代码 push 就自动编译；也能在 Actions 页面手动点 Run workflow
 on:
   push:
     branches: [ main, master ]
@@ -13,20 +12,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 不用第三方 theos-action（它 cd theos/sdks 会因新版 Theos 无此目录而失败）
       - name: Setup Theos
-        uses: Randomblock1/theos-action@v1
-        with:
-          theos-dir: theos
-          theos-src: https://github.com/theos/theos
-          theos-sdks: https://github.com/theos/sdks
+        run: |
+          git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/theos/theos.git theos
+          echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
+
+      - name: Setup iOS SDK
+        run: |
+          git clone --depth 1 https://github.com/theos/sdks.git "$GITHUB_WORKSPACE/theos/sdks"
 
       - name: Build dylib
         run: |
-          export THEOS=$GITHUB_WORKSPACE/theos
           make clean
           make
 
-      # 把编出来的 dylib 传成构建产物，直接在网页下载
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
