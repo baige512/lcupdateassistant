@@ -7,7 +7,7 @@
  * LCUpdateAssistant · LiveContainer 软件源辅助
  *
  * 功能：
- *   1. 「源」页顶部常驻蓝色按钮「激活软件源」，点开设置菜单
+ *   1. 「源」页顶部常驻蓝色按钮「八区软件源」，点开面板（免责声明 + 设备/站点信息 + 功能菜单）
  *   2. 摇一摇 / 菜单呼出「卡密解锁」，卡密或 UDID 二选一，直接调 api.php 激活/验证
  *   3. 解锁成功后自动把「带 UDID 的专属源」导入 LiveContainer 软件源列表，不用手动添加
  *   4. 回前台静默查源，本机版本落后时提示（不再提供无效的「立即检查更新」入口）
@@ -16,6 +16,9 @@
  *   iOS 普通 App 拿不到真机 UDID，identifierForVendor 跟后台设备表对不上。
  *   所以 UDID 必须用户从描述文件获取后手输/粘贴，插件不假装能自动拿。
  *
+ * v2.0：按钮/面板改名「八区软件源」；面板正文换成免责声明 + 设备 UID / 当前 IP / 会员到期 /
+ *       站内应用数 / 本次更新 / 数据刷新 / QQ 群；解锁成功弹窗去掉源地址块与「复制源地址」按钮，
+ *       UDID 提到到期时间上方；去掉「复制专属源地址（带 UDID）」菜单项。
  * v1.9：按钮改蓝色；去掉「诊断软件源」「立即检查更新」；解锁成功自动导入专属源
  *       （写 LCAltStoreSourceURLs + 预置缓存 + livecontainer://source 深链即时生效）。
  * v1.8：去掉无用弹窗；模块页双击恢复被隐藏的按钮。
@@ -29,6 +32,8 @@ static NSTimeInterval const kCheckInterval = 1800.0;
 static BOOL const kEnableShakeUnlock  = YES;
 static BOOL const kEnableFloatButton  = YES;   // 常驻悬浮设置按钮
 static NSString *const kButtonHiddenKey = @"lcua_float_hidden";
+static NSString *const kAppTitle        = @"八区软件源";   // 按钮 + 面板标题
+static NSString *const kQQGroup         = @"565911547";
 // ------------------------------------------
 
 // observer 必须强引用持有
@@ -129,6 +134,151 @@ static NSString *LCStripQuery(NSString *u) {
     return r.location == NSNotFound ? u : [u substringToIndex:r.location];
 }
 
+// ============ 面板统计信息（UID / IP / 到期 / 应用数 / 更新数 / 刷新时间）============
+static NSString *LCFormatDate(NSDate *d, NSString *fmt) {
+    static NSDateFormatter *f = nil;
+    static NSString *curFmt = nil;
+    if (!f) f = [[NSDateFormatter alloc] init];
+    if (![curFmt isEqualToString:fmt]) { f.dateFormat = fmt; curFmt = fmt; }
+    return [f stringFromDate:d] ?: @"";
+}
+
+static NSDate *LCDateFromString(NSString *s) {
+    if (s.length == 0) return nil;
+    static NSDateFormatter *f = nil;
+    if (!f) { f = [[NSDateFormatter alloc] init]; f.dateFormat = @"yyyy-MM-dd HH:mm:ss"; }
+    return [f dateFromString:s];
+}
+
+static NSInteger LCDaysLeftOf(NSString *expire) {
+    NSDate *d = LCDateFromString(expire);
+    if (!d) return -1;
+    NSTimeInterval left = [d timeIntervalSinceNow];
+    if (left < 0) return 0;
+    return (NSInteger)ceil(left / 86400.0);
+}
+
+// 从任意文本里抠出第一个 IPv4（myip.ipip.net / ip.3322.net 返回纯文本）
+static NSString *LCFirstIPv4(NSString *s) {
+    if (s.length == 0) return nil;
+    NSUInteger n = s.length, i = 0;
+    NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
+    while (i < n) {
+        if (![digits characterIsMember:[s characterAtIndex:i]]) { i++; continue; }
+        NSMutableString *buf = [NSMutableString string];
+        NSUInteger j = i;
+        while (j < n) {
+            unichar c = [s characterAtIndex:j];
+            if ([digits characterIsMember:c] || c == '.') { [buf appendFormat:@"%C", c]; j++; }
+            else break;
+        }
+        NSString *cand = [buf stringByTrimmingCharactersInSet:
+                          [NSCharacterSet characterSetWithCharactersInString:@"."]];
+        NSArray *parts = [cand componentsSeparatedByString:@"."];
+        if (parts.count == 4 && cand.length >= 7) {
+            BOOL ok = YES;
+            for (NSString *p in parts) { if (p.length == 0 || p.length > 3) { ok = NO; break; } }
+            if (ok) return cand;
+        }
+        i = (j > i) ? j : i + 1;
+    }
+    return nil;
+}
+
+static void LCFetchClientIPFrom(NSArray *urls, NSUInteger idx) {
+    if (idx >= urls.count) return;
+    NSURL *u = [NSURL URLWithString:urls[idx]];
+    if (!u) { LCFetchClientIPFrom(urls, idx + 1); return; }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+    req.timeoutInterval = 8;
+    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSString *ip = nil;
+        if (!err && data.length) {
+            ip = LCFirstIPv4([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
+        }
+        if (ip.length) {
+            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+            [ud setObject:ip forKey:@"lcua_last_ip"];
+            [ud synchronize];
+            return;
+        }
+        LCFetchClientIPFrom(urls, idx + 1);
+    }] resume];
+}
+
+static void LCFetchClientIP(void) {
+    // 依次尝试，前一个不通再换下一个
+    LCFetchClientIPFrom(@[@"https://myip.ipip.net", @"https://ip.3322.net", @"https://api.ipify.org"], 0);
+}
+
+// 记录「本站现有应用 / 本次更新 / 刷新时间」：与上次快照比版本号得出更新数
+static void LCRecordSourceStats(NSArray *apps) {
+    if (![apps isKindOfClass:[NSArray class]]) return;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary *verMap = [NSMutableDictionary dictionary];
+    NSString *today = LCFormatDate([NSDate date], @"yyyy-MM-dd");
+    NSInteger todayUpdates = 0;
+
+    for (id it in apps) {
+        if (![it isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *a = (NSDictionary *)it;
+        NSString *bid = [a[@"bundleIdentifier"] description] ?: @"";
+        NSString *ver = [a[@"version"] description] ?: @"";
+        if (bid.length) verMap[bid] = ver;
+        NSString *vd = [a[@"versionDate"] description] ?: @"";
+        if (vd.length >= 10 && [[vd substringToIndex:10] isEqualToString:today]) todayUpdates++;
+    }
+
+    NSDictionary *prev = [ud dictionaryForKey:@"lcua_ver_map"];
+    NSInteger changed = -1;
+    if ([prev isKindOfClass:[NSDictionary class]] && prev.count > 0) {
+        changed = 0;
+        for (NSString *bid in verMap) {
+            id old = prev[bid];
+            if (![old isKindOfClass:[NSString class]] || ![(NSString *)old isEqualToString:verMap[bid]]) changed++;
+        }
+    }
+    if (changed < 0) changed = todayUpdates;   // 首次没有快照，退化成「今天更新的数量」
+
+    [ud setObject:@((NSInteger)apps.count) forKey:@"lcua_app_count"];
+    [ud setObject:@(changed) forKey:@"lcua_update_count"];
+    [ud setObject:LCFormatDate([NSDate date], @"yyyy-MM-dd HH:mm:ss") forKey:@"lcua_stats_time"];
+    [ud setObject:verMap forKey:@"lcua_ver_map"];
+    [ud synchronize];
+}
+
+// 面板正文：免责声明 + 设备信息 + 站点数据
+static NSString *LCStatsMessage(void) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSString *udid   = [ud stringForKey:@"lcua_last_udid"] ?: @"";
+    NSString *ip     = [ud stringForKey:@"lcua_last_ip"] ?: @"";
+    NSString *expire = [ud stringForKey:@"lcua_expire"] ?: @"";
+    NSString *time   = [ud stringForKey:@"lcua_stats_time"] ?: @"";
+    NSNumber *appCnt = [ud objectForKey:@"lcua_app_count"];
+    NSNumber *updCnt = [ud objectForKey:@"lcua_update_count"];
+
+    NSString *appsLine = (appCnt && updCnt)
+        ? [NSString stringWithFormat:@"本站现有应用：%ld 款｜本次更新：%ld 款",
+           (long)[appCnt integerValue], (long)[updCnt integerValue]]
+        : @"本站现有应用：读取中…";
+
+    return [NSString stringWithFormat:
+        @"所有资源均来自网络公开分享，仅用于个人学习交流，严禁商用，违规后果自行承担，如有版权问题请联系我们下架！请勿使用本源安装、分发违规相关应用及文件，账号封禁与本软件源无关。\n"
+        @"设备 UID：%@\n"
+        @"当前 IP：%@\n"
+        @"会员到期时间：%@\n"
+        @"%@\n"
+        @"数据刷新：%@\n"
+        @"交流QQ群：【%@】",
+        udid.length ? udid : @"未解锁",
+        ip.length ? ip : @"获取中…",
+        expire.length ? expire : @"未解锁",
+        appsLine,
+        time.length ? time : LCFormatDate([NSDate date], @"yyyy-MM-dd HH:mm:ss"),
+        kQQGroup];
+}
+
 static NSComparisonResult LCCompareVersion(NSString *a, NSString *b) {
     return [a compare:b options:NSNumericSearch];
 }
@@ -172,6 +322,9 @@ static void LCRunCheck(void) {
         if (je || ![obj isKindOfClass:[NSDictionary class]]) return;
         NSArray *apps = ((NSDictionary *)obj)[@"apps"];
         if (![apps isKindOfClass:[NSArray class]]) return;
+
+        // 顺手把面板要用的统计（应用数 / 更新数 / 刷新时间）记下来
+        LCRecordSourceStats(apps);
 
         NSDictionary *info = [NSBundle mainBundle].infoDictionary;
         NSString *bid = [info objectForKey:@"CFBundleIdentifier"] ?: @"";
@@ -290,10 +443,40 @@ static void LCOpenSourceDeepLink(NSString *udidSrc) {
     });
 }
 
-// 解锁成功后的统一提示：记 UDID + 自动导入专属源
-static void LCUnlockSuccess(NSString *udid, NSString *message) {
-    [[NSUserDefaults standardUserDefaults] setObject:udid forKey:@"lcua_last_udid"];
-    [[NSUserDefaults standardUserDefaults] synchronize];
+// 后台刷新面板数据：源应用数/更新数 + 公网 IP + 会员到期
+static void LCRefreshStatsAsync(void) {
+    NSString *udid = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_last_udid"] ?: @"";
+    NSURL *url = [NSURL URLWithString:LCSourceURLWithUDID(udid)];
+    if (url) {
+        [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            if (err || !data.length) return;
+            id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if (![obj isKindOfClass:[NSDictionary class]]) return;
+            NSArray *apps = ((NSDictionary *)obj)[@"apps"];
+            if ([apps isKindOfClass:[NSArray class]]) LCRecordSourceStats(apps);
+        }] resume];
+    }
+    LCFetchClientIP();
+    if (udid.length == 0) return;
+    LCAPICall(@"validate", @{@"device_id": udid}, ^(NSDictionary *res, NSString *err) {
+        if (err || ![[res objectForKey:@"success"] boolValue]) return;
+        id d = [res objectForKey:@"data"];
+        if (![d isKindOfClass:[NSDictionary class]]) return;
+        id exp = [(NSDictionary *)d objectForKey:@"expire_time"];
+        if ([exp isKindOfClass:[NSString class]] && [(NSString *)exp length]) {
+            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+            [ud setObject:exp forKey:@"lcua_expire"];
+            [ud synchronize];
+        }
+    });
+}
+
+// 解锁成功后的统一提示：记 UDID / 到期时间 + 自动导入专属源
+static void LCUnlockSuccess(NSString *udid, NSString *expire, NSString *note) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setObject:udid forKey:@"lcua_last_udid"];
+    if (expire.length) [ud setObject:expire forKey:@"lcua_expire"];
+    [ud synchronize];
     NSString *udidSrc = LCSourceURLWithUDID(udid);
 
     BOOL isLC = LCIsLiveContainerApp();
@@ -312,11 +495,23 @@ static void LCUnlockSuccess(NSString *udid, NSString *message) {
     } else {
         tail = @"已自动导入到「软件源」，切到「源」页就能看到付费 App。\n若列表没变，重启一次 LiveContainer 即可。";
     }
-    NSString *msg = [NSString stringWithFormat:@"%@\n\n专属源地址（已带 UDID）：\n%@\n\n%@", message, udidSrc, tail];
+    if (!isLC) tail = [tail stringByAppendingFormat:@"\n%@", udidSrc];
+
+    NSMutableArray *lines = [NSMutableArray array];
+    if (note.length) [lines addObject:note];
+    [lines addObject:[NSString stringWithFormat:@"UDID：%@", udid]];
+    if (expire.length) {
+        [lines addObject:[NSString stringWithFormat:@"到期：%@", expire]];
+        NSInteger left = LCDaysLeftOf(expire);
+        if (left >= 0) [lines addObject:[NSString stringWithFormat:@"剩余：%ld 天", (long)left]];
+    }
+    NSString *msg = [NSString stringWithFormat:@"%@\n\n%@", [lines componentsJoinedByString:@"\n"], tail];
     LCShowAlert(@"解锁成功", msg, @[
-        [UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil],
-        [UIAlertAction actionWithTitle:@"复制专属源地址" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { LCCopy(udidSrc); }]
+        [UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]
     ]);
+
+    // 顺手刷新面板要显示的 IP / 统计
+    LCFetchClientIP();
 }
 
 // 路径 A：两个都填 —— 新卡首次激活（原逻辑）
@@ -325,7 +520,9 @@ static void LCActivateBoth(NSString *card, NSString *udid) {
         if (errMsg) { LCShowAlert(@"激活失败", errMsg, @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]); return; }
         BOOL ok = [[res objectForKey:@"success"] boolValue];
         NSString *msg = [res objectForKey:@"message"] ?: (ok ? @"激活成功" : @"激活失败");
-        if (ok) LCUnlockSuccess(udid, msg);
+        NSDictionary *data = [res objectForKey:@"data"];
+        NSString *expire = [data isKindOfClass:[NSDictionary class]] ? ([data objectForKey:@"expire_time"] ?: @"") : @"";
+        if (ok) LCUnlockSuccess(udid, expire, msg);
         else LCShowAlert(@"激活失败", msg, @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
     });
 }
@@ -343,9 +540,7 @@ static void LCValidateUdid(NSString *udid) {
         }
         NSDictionary *data = [res objectForKey:@"data"];
         NSString *expire = [data objectForKey:@"expire_time"] ?: @"";
-        NSString *left = [data objectForKey:@"days_left"] ?: @"";
-        NSString *detail = [NSString stringWithFormat:@"设备已激活，未过期。\n到期：%@\n剩余：%@ 天", expire, left];
-        LCUnlockSuccess(udid, detail);
+        LCUnlockSuccess(udid, expire, @"设备已激活，未过期。");
     });
 }
 
@@ -414,7 +609,7 @@ static void LCShowUnlockDialog(void) {
     });
 }
 
-// ============ 顶部固定「激活软件源」按钮 ============
+// ============ 顶部固定「八区软件源」按钮 ============
 static UIView *lcFloatButton = nil;
 
 static void LCShowSettingsMenu(void);
@@ -439,7 +634,7 @@ static void LCShowSettingsMenu(void);
     self.layer.shadowOffset = CGSizeMake(0, 2);
 
     UILabel *label = [[UILabel alloc] initWithFrame:self.bounds];
-    label.text = @"激活软件源";
+    label.text = kAppTitle;
     label.textColor = [UIColor whiteColor];
     label.font = [UIFont boldSystemFontOfSize:13];
     label.textAlignment = NSTextAlignmentCenter;
@@ -538,7 +733,7 @@ static void LCAttachFloatButton(void);   // 前置声明（双击恢复要用）
     [[NSUserDefaults standardUserDefaults] setBool:NO forKey:kButtonHiddenKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
     LCAttachFloatButton();
-    LCShowAlert(@"按钮已恢复", @"「激活软件源」按钮已重新显示在「源」页。",
+    LCShowAlert(@"按钮已恢复", [NSString stringWithFormat:@"「%@」按钮已重新显示在「源」页。", kAppTitle],
         @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
 }
 @end
@@ -582,11 +777,17 @@ static void LCAttachFloatButton(void) {
 }
 
 static void LCShowSettingsMenu(void) {
-    NSString *src = LCSourceURL();
-    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_last_udid"] ?: @"";
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSString *saved = [ud stringForKey:@"lcua_last_udid"] ?: @"";
     NSString *u = LCSourceURLWithUDID(saved);
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"激活软件源"
-        message:[NSString stringWithFormat:@"源：%@\nUDID：%@", src, saved.length ? saved : @"未记录"]
+
+    // 数据超过 5 分钟没刷新就后台静默拉一遍，下次打开面板就是新数字
+    NSString *statsTime = [ud stringForKey:@"lcua_stats_time"] ?: @"";
+    NSDate *last = statsTime.length ? LCDateFromString(statsTime) : nil;
+    if (!last || -[last timeIntervalSinceNow] > 300) LCRefreshStatsAsync();
+
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:kAppTitle
+        message:LCStatsMessage()
         preferredStyle:UIAlertControllerStyleActionSheet];
 
     [sheet addAction:[UIAlertAction actionWithTitle:@"卡密解锁（卡密或 UDID 二选一）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
@@ -602,13 +803,11 @@ static void LCShowSettingsMenu(void) {
         LCImportSourceToDefaults(u, &existed);
         LCWarmSourceCache(u);
         if (!existed) LCOpenSourceDeepLink(u);
+        LCRefreshStatsAsync();
         LCShowAlert(@"已导入", existed
             ? @"这个源已经在「软件源」列表里了，切到「源」页下拉刷新即可。"
             : @"专属源已加进「软件源」，切到「源」页就能看到付费 App。\n若列表没变，重启一次 LiveContainer 即可。",
             @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"复制专属源地址（带 UDID）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        LCCopy(u);
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"隐藏此按钮" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
         LCHideFloatButton();
