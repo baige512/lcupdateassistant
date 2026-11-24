@@ -485,6 +485,8 @@ static void LCHideFloatButton(void) {
     if (lcFloatButton) [lcFloatButton removeFromSuperview];
 }
 
+static void LCAttachFloatButton(void);   // 前置声明（双击恢复要用）
+
 // -------- 双击「模块」页恢复被隐藏的按钮 --------
 static BOOL lcModulesDoubleTapFired = NO;
 
