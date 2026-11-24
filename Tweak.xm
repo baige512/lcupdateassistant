@@ -1,5 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+// Logos Internal 生成器要求显式导入 objc/message.h（用原生 runtime 做 hook，不依赖 CydiaSubstrate）
+#import <objc/message.h>
 
 /*
  * LCUpdateAssistant · LiveContainer 软件源辅助 (v1.2 解锁版)
