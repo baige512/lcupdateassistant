@@ -186,25 +186,15 @@ static void LCRunCheck(void) {
 }
 
 // ================= 卡密解锁 =================
-static void LCDoActivate(NSString *cardKey, NSString *deviceId) {
-    cardKey = [cardKey stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    deviceId = [deviceId stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (cardKey.length == 0 || deviceId.length == 0) {
-        LCShowAlert(@"填写不完整", @"卡密和 UDID 都要填。UDID 需要用 Safari 装描述文件获取。",
-            @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
-        return;
-    }
+// 通用 POST：action -> 服务器 JSON
+static void LCAPICall(NSString *action, NSDictionary *params, void (^done)(NSDictionary *res, NSString *errMsg)) {
+    NSURL *url = [NSURL URLWithString:LCAPIURL()];
+    if (!url) { done(nil, @"apiURL 配置不正确"); return; }
 
-    NSString *api = LCAPIURL();
-    NSURL *url = [NSURL URLWithString:api];
-    if (!url) {
-        LCShowAlert(@"地址无效", @"apiURL 配置不正确，请检查源码常量或 plist。",
-            @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
-        return;
-    }
-
-    NSString *body = [NSString stringWithFormat:@"action=activate&card_key=%@&device_id=%@&api_key=%@",
-        LCURLEncode(cardKey), LCURLEncode(deviceId), LCURLEncode(LCAPIKey())];
+    NSMutableString *body = [NSMutableString stringWithFormat:@"action=%@&api_key=%@", LCURLEncode(action), LCURLEncode(LCAPIKey())];
+    [params enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+        [body appendFormat:@"&%@=%@", LCURLEncode(k), LCURLEncode(v)];
+    }];
 
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
@@ -213,219 +203,419 @@ static void LCDoActivate(NSString *cardKey, NSString *deviceId) {
     req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
 
     [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        if (err) {
-            LCShowAlert(@"激活失败", err.localizedDescription,
-                @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
-            return;
-        }
+        if (err) { done(nil, err.localizedDescription); return; }
         NSError *je = nil;
         id obj = [NSJSONSerialization JSONObjectWithData:data ?: [NSData data] options:0 error:&je];
         if (je || ![obj isKindOfClass:[NSDictionary class]]) {
             NSString *raw = [[NSString alloc] initWithData:data ?: [NSData data] encoding:NSUTF8StringEncoding] ?: @"";
-            LCShowAlert(@"激活失败", [NSString stringWithFormat:@"后台返回无法解析：%@", [raw substringToIndex:MIN(raw.length, 200)]],
+            done(nil, [NSString stringWithFormat:@"后台返回无法解析：%@", [raw substringToIndex:MIN(raw.length, 160)]]);
+            return;
+        }
+        done((NSDictionary *)obj, nil);
+    }] resume];
+}
+
+// 解锁成功后的统一提示：记 UDID + 给带 udid 的专属源
+static void LCUnlockSuccess(NSString *udid, NSString *message) {
+    [[NSUserDefaults standardUserDefaults] setObject:udid forKey:@"lcua_last_udid"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    NSString *src = LCSourceURL();
+    NSString *udidSrc = ([src rangeOfString:@"?"].location == NSNotFound)
+        ? [src stringByAppendingFormat:@"?udid=%@", LCURLEncode(udid)]
+        : [src stringByAppendingFormat:@"&udid=%@", LCURLEncode(udid)];
+    NSString *msg = [NSString stringWithFormat:@"%@\n\n专属源地址（已带 UDID）：\n%@\n\n请回 LiveContainer 添加/刷新这个源，付费 App 就会出现。", message, udidSrc];
+    LCShowAlert(@"解锁成功", msg, @[
+        [UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil],
+        [UIAlertAction actionWithTitle:@"复制专属源地址" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { LCCopy(udidSrc); }]
+    ]);
+}
+
+// 路径 A：两个都填 —— 新卡首次激活（原逻辑）
+static void LCActivateBoth(NSString *card, NSString *udid) {
+    LCAPICall(@"activate", @{@"card_key": card, @"device_id": udid}, ^(NSDictionary *res, NSString *errMsg) {
+        if (errMsg) { LCShowAlert(@"激活失败", errMsg, @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]); return; }
+        BOOL ok = [[res objectForKey:@"success"] boolValue];
+        NSString *msg = [res objectForKey:@"message"] ?: (ok ? @"激活成功" : @"激活失败");
+        if (ok) LCUnlockSuccess(udid, msg);
+        else LCShowAlert(@"激活失败", msg, @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
+    });
+}
+
+// 路径 B：只填 UDID —— 已激活未过期的设备直接放行（validate）
+static void LCValidateUdid(NSString *udid) {
+    LCAPICall(@"validate", @{@"device_id": udid}, ^(NSDictionary *res, NSString *errMsg) {
+        if (errMsg) { LCShowAlert(@"验证失败", errMsg, @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]); return; }
+        BOOL ok = [[res objectForKey:@"success"] boolValue];
+        NSString *msg = [res objectForKey:@"message"] ?: @"";
+        if (!ok) {
+            LCShowAlert(@"未解锁", [NSString stringWithFormat:@"该 UDID 未激活或已过期：%@", msg],
                 @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
             return;
         }
-        NSDictionary *res = (NSDictionary *)obj;
-        BOOL ok = [[res objectForKey:@"success"] boolValue];
-        NSString *message = [res objectForKey:@"message"] ?: (ok ? @"激活成功" : @"激活失败");
+        NSDictionary *data = [res objectForKey:@"data"];
+        NSString *expire = [data objectForKey:@"expire_time"] ?: @"";
+        NSString *left = [data objectForKey:@"days_left"] ?: @"";
+        NSString *detail = [NSString stringWithFormat:@"设备已激活，未过期。\n到期：%@\n剩余：%@ 天", expire, left];
+        LCUnlockSuccess(udid, detail);
+    });
+}
 
-        if (ok) {
-            // 记住 UDID，下次预填
-            [[NSUserDefaults standardUserDefaults] setObject:deviceId forKey:@"lcua_last_udid"];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-            // 专属源地址：带上刚激活的 udid
-            NSString *src = LCSourceURL();
-            NSString *udidSrc = [src rangeOfString:@"?"].location == NSNotFound
-                ? [src stringByAppendingFormat:@"?udid=%@", LCURLEncode(deviceId)]
-                : [src stringByAppendingFormat:@"&udid=%@", LCURLEncode(deviceId)];
-            NSString *msg = [NSString stringWithFormat:@"%@\n\n专属源地址（已带 UDID）：\n%@\n\n请回 LiveContainer 添加/刷新这个源，付费 App 就会出现。", message, udidSrc];
-            LCShowAlert(@"解锁成功", msg, @[
-                [UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil],
-                [UIAlertAction actionWithTitle:@"复制专属源地址" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-                    LCCopy(udidSrc);
-                }]
-            ]);
-        } else {
-            LCShowAlert(@"解锁失败", message,
+// 路径 C：只填卡密 —— query 拿绑定 UDID，再 validate 确认未过期
+static void LCQueryCard(NSString *card) {
+    LCAPICall(@"query", @{@"card_key": card}, ^(NSDictionary *res, NSString *errMsg) {
+        if (errMsg) { LCShowAlert(@"查询失败", errMsg, @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]); return; }
+        BOOL ok = [[res objectForKey:@"success"] boolValue];
+        if (!ok) {
+            LCShowAlert(@"查询失败", [res objectForKey:@"message"] ?: @"卡密不存在",
                 @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
+            return;
         }
-    }] resume];
+        NSDictionary *data = [res objectForKey:@"data"];
+        NSString *bind = [data objectForKey:@"bind_device"] ?: @"";
+        NSString *status = [data objectForKey:@"status_name"] ?: @"";
+        if (bind.length == 0) {
+            LCShowAlert(@"卡密未绑定设备", [NSString stringWithFormat:@"状态：%@\n这张卡还没绑定 UDID，请卡密和 UDID 一起填来首次激活。", status],
+                @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
+            return;
+        }
+        // 拿到绑定 UDID 后，走 validate 确认未过期（复用路径 B）
+        LCValidateUdid(bind);
+    });
+}
+
+// 统一入口：两个都填=激活；只填卡密=查询绑定设备；只填UDID=验证已激活
+static void LCUnlock(NSString *card, NSString *udid) {
+    card = [card stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    udid = [udid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (card.length == 0 && udid.length == 0) {
+        LCShowAlert(@"填写不完整", @"卡密和 UDID 至少填一个。\n两个都填 = 新卡激活；只填卡密 = 查绑定设备；只填 UDID = 验证已激活设备。",
+            @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
+        return;
+    }
+    if (card.length > 0 && udid.length > 0) LCActivateBoth(card, udid);
+    else if (udid.length > 0) LCValidateUdid(udid);
+    else LCQueryCard(card);
 }
 
 static void LCShowUnlockDialog(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_last_udid"] ?: @"";
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"卡密解锁"
-            message:@"输入卡密和 UDID，直接向服务器激活。\nUDID 需用 Safari 装描述文件获取，普通 App 拿不到真 UDID。"
+            message:@"已激活未过期的：只填卡密 或 只填 UDID 即可。\n新卡首次激活：两个都填。\nUDID 需用 Safari 装描述文件获取。"
             preferredStyle:UIAlertControllerStyleAlert];
 
         [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-            tf.placeholder = @"卡密";
+            tf.placeholder = @"卡密（已激活的填这个即可）";
             tf.secureTextEntry = YES;
             tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
         }];
         [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-            tf.placeholder = @"设备 UDID";
+            tf.placeholder = @"设备 UDID（已激活的填这个即可）";
             tf.text = saved;
             tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
         }];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"激活" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"解锁" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             NSString *card = alert.textFields.count > 0 ? alert.textFields[0].text : @"";
             NSString *udid = alert.textFields.count > 1 ? alert.textFields[1].text : @"";
-            LCDoActivate(card, udid);
+            LCUnlock(card, udid);
         }]];
         LCPresent(alert, 4);
     });
 }
 
 // ============ 常驻悬浮设置按钮 ============
+
 static UIView *lcFloatButton = nil;
+
+
 
 static void LCShowSettingsMenu(void);
 
+
+
 // 自定义按钮视图：自己处理拖动和点击（纯 ObjC，不依赖 Logos）
+
 @interface LCFloatButtonView : UIView
+
 @property (nonatomic, copy) void (^onTap)(void);
+
 @property (nonatomic, copy) void (^onMove)(CGFloat x, CGFloat yRatio);
+
 @end
+
+
 
 @implementation LCFloatButtonView
 
+
+
 - (instancetype)initWithFrame:(CGRect)frame {
+
     self = [super initWithFrame:frame];
+
     if (!self) return nil;
+
     self.layer.cornerRadius = frame.size.width / 2;
+
     self.backgroundColor = [UIColor colorWithRed:0.36 green:0.24 blue:0.72 alpha:0.92];
+
     self.layer.shadowColor = [UIColor blackColor].CGColor;
+
     self.layer.shadowOpacity = 0.32;
+
     self.layer.shadowRadius = 6;
+
     self.layer.shadowOffset = CGSizeMake(0, 2);
 
+
+
     UILabel *label = [[UILabel alloc] initWithFrame:self.bounds];
+
     label.text = @"设置";
+
     label.textColor = [UIColor whiteColor];
+
     label.font = [UIFont boldSystemFontOfSize:14];
+
     label.textAlignment = NSTextAlignmentCenter;
+
     label.userInteractionEnabled = NO;
+
     [self addSubview:label];
 
+
+
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(lcTapped)];
+
     [self addGestureRecognizer:tap];
+
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(lcPanned:)];
+
     [self addGestureRecognizer:pan];
+
     return self;
+
 }
+
+
 
 - (void)lcTapped {
+
     if (self.onTap) self.onTap();
+
 }
+
+
 
 - (void)lcPanned:(UIPanGestureRecognizer *)g {
+
     UIWindow *win = self.window;
+
     if (!win) return;
+
     CGPoint p = [g translationInView:win];
+
     CGPoint c = self.center;
+
     c.x += p.x;
+
     c.y += p.y;
+
     c.x = MAX(28, MIN(c.x, win.bounds.size.width - 28));
+
     c.y = MAX(80, MIN(c.y, win.bounds.size.height - 70));
+
     self.center = c;
+
     [g setTranslation:CGPointZero inView:win];
+
     if (g.state == UIGestureRecognizerStateEnded && self.onMove) {
+
         self.onMove(self.frame.origin.x, self.frame.origin.y / win.bounds.size.height);
+
     }
+
 }
+
 @end
 
+
+
 static void LCPositionButton(UIView *btn) {
+
     UIWindow *win = [UIApplication sharedApplication].keyWindow;
+
     if (!win) return;
+
     CGSize ws = win.bounds.size;
+
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+
     CGFloat x = [ud floatForKey:kButtonXKey];
+
     CGFloat yRatio = [ud floatForKey:kButtonYKey];
+
     if (x <= 0) x = ws.width - 66;          // 默认右侧
+
     if (yRatio <= 0) yRatio = 0.42;          // 默认偏上
+
     x = MAX(4, MIN(x, ws.width - 56));
+
     CGFloat y = MAX(60, MIN(yRatio * ws.height, ws.height - 100));
+
     btn.frame = CGRectMake(x, y, 52, 52);
+
 }
+
+
 
 static void LCHideFloatButton(void) {
+
     [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kButtonHiddenKey];
+
     [[NSUserDefaults standardUserDefaults] synchronize];
+
     if (lcFloatButton) [lcFloatButton removeFromSuperview];
+
 }
+
+
 
 static UIView *LCMakeFloatButton(void) {
+
     return [[LCFloatButtonView alloc] initWithFrame:CGRectMake(0, 0, 52, 52)];
+
 }
+
+
 
 static void LCAttachFloatButton(void) {
+
     if (!kEnableFloatButton) return;
+
     if ([[NSUserDefaults standardUserDefaults] boolForKey:kButtonHiddenKey]) return;
+
     UIWindow *win = [UIApplication sharedApplication].keyWindow;
+
     if (!win) {
+
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ LCAttachFloatButton(); });
+
         return;
+
     }
+
     if (lcFloatButton && lcFloatButton.superview == win) { LCPositionButton(lcFloatButton); return; }
 
+
+
     LCFloatButtonView *btn = (LCFloatButtonView *)LCMakeFloatButton();
+
     if (!lcFloatButton) lcFloatButton = btn;
+
     [win addSubview:lcFloatButton];
+
     LCPositionButton(lcFloatButton);
 
+
+
     __weak UIView *weakBtn = lcFloatButton;
+
     ((LCFloatButtonView *)lcFloatButton).onTap = ^{ LCShowSettingsMenu(); };
+
     ((LCFloatButtonView *)lcFloatButton).onMove = ^(CGFloat x, CGFloat yRatio) {
+
         UIView *b = weakBtn;
+
         if (!b) return;
+
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+
         [ud setFloat:x forKey:kButtonXKey];
+
         [ud setFloat:yRatio forKey:kButtonYKey];
+
         [ud synchronize];
+
     };
+
 }
+
+
 
 static void LCShowSettingsMenu(void) {
+
     NSString *src = LCSourceURL();
+
     NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_last_udid"] ?: @"";
+
     NSString *u = src;
+
     if (saved.length) {
+
         u = ([src rangeOfString:@"?"].location == NSNotFound)
+
             ? [src stringByAppendingFormat:@"?udid=%@", LCURLEncode(saved)]
+
             : [src stringByAppendingFormat:@"&udid=%@", LCURLEncode(saved)];
+
     }
+
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"LC 辅助设置"
+
         message:[NSString stringWithFormat:@"源：%@\nUDID：%@", src, saved.length ? saved : @"未记录"]
+
         preferredStyle:UIAlertControllerStyleActionSheet];
 
+
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"卡密解锁（输入卡密 + UDID）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+
         LCShowUnlockDialog();
+
     }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"复制专属源地址（带 UDID）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+
         LCCopy(u);
+
     }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"立即检查更新" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+
         [[NSUserDefaults standardUserDefaults] removeObjectForKey:LCKey(@"lcua_last_check")];
+
         LCRunCheck();
+
     }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"隐藏此按钮" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+
         LCHideFloatButton();
+
     }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 
+
+
     sheet.popoverPresentationController.sourceView = lcFloatButton;
+
     sheet.popoverPresentationController.sourceRect = lcFloatButton.bounds;
+
     dispatch_async(dispatch_get_main_queue(), ^{
+
         UIViewController *top = LCTopVC();
+
         if (top && !top.presentedViewController) [top presentViewController:sheet animated:YES completion:nil];
+
     });
+
 }
+
+
 
 static void LCFirstRunHint(void) {
     if (!kEnableFirstRunHint) return;
