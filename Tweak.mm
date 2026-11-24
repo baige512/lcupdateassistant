@@ -27,7 +27,6 @@ static NSString *const kDefaultSourceURL = @"https://app.baqu.net/altstore.php/a
 static NSString *const kDefaultAPIURL    = @"https://app.baqu.net/api.php";
 static NSString *const kDefaultAPIKey    = @"";   // 后台「API密钥」为空就留空；填了则必须一致
 static NSTimeInterval const kCheckInterval = 1800.0;
-static BOOL const kEnableFirstRunHint = NO;   // 首次弹窗已关闭（太烦）
 static BOOL const kEnableShakeUnlock  = YES;
 static BOOL const kEnableFloatButton  = YES;   // 常驻悬浮设置按钮
 static NSString *const kButtonHiddenKey = @"lcua_float_hidden";
@@ -488,8 +487,6 @@ static void LCHideFloatButton(void) {
 static void LCAttachFloatButton(void);   // 前置声明（双击恢复要用）
 
 // -------- 双击「模块」页恢复被隐藏的按钮 --------
-static BOOL lcModulesDoubleTapFired = NO;
-
 @interface LCDoubleTapTarget : NSObject
 - (void)onDoubleTap;
 @end
@@ -582,19 +579,6 @@ static void LCShowSettingsMenu(void) {
         UIViewController *top = LCTopVC();
         if (top && !top.presentedViewController) [top presentViewController:sheet animated:YES completion:nil];
     });
-}
-
-static void LCFirstRunHint(void) {
-    if (!kEnableFirstRunHint) return;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    if ([ud boolForKey:@"lcua_first_run_done"]) return;
-    [ud setBool:YES forKey:@"lcua_first_run_done"];
-    [ud synchronize];
-    NSString *msg = kEnableShakeUnlock
-        ? @"插件正在工作。\n\n· 有新版本会自动提示\n· 想解锁：摇一摇手机，输入卡密 + UDID 即可激活"
-        : @"插件正在工作，发现新版本会提示。";
-    LCShowAlert(@"LCUpdateAssistant 已加载", msg,
-        @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
 }
 
 // ============ 原生 runtime hook（不依赖 Logos / CydiaSubstrate）============
