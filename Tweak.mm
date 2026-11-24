@@ -8,14 +8,17 @@
  *
  * 功能：
  *   1. 「源」页顶部常驻蓝色按钮「八区软件源」，点开面板（免责声明 + 设备/站点信息 + 功能菜单）
- *   2. 摇一摇 / 菜单呼出「卡密解锁」，卡密或 UDID 二选一，直接调 api.php 激活/验证
+ *   2. 面板里「卡密解锁」：卡密或 UDID 二选一，直接调 api.php 激活/验证；解锁框内可一键跳 Safari 取本机 UDID，装完回来自动填入
  *   3. 解锁成功后自动把「带 UDID 的专属源」导入 LiveContainer 软件源列表，不用手动添加
- *   4. 回前台静默查源，本机版本落后时提示（不再提供无效的「立即检查更新」入口）
+ *   4. 换网络导致付费应用被拦时，自动打开站点首页完成改绑，再拉一次源
+ *   5. 回前台静默查源，本机版本落后时提示
  *
  * 硬限制（写在前面，别踩坑）：
  *   iOS 普通 App 拿不到真机 UDID，identifierForVendor 跟后台设备表对不上。
- *   所以 UDID 必须用户从描述文件获取后手输/粘贴，插件不假装能自动拿。
+ *   UDID 只能借 Safari 装一次描述文件拿，插件跳到站点 udid.php 用令牌换回来。
  *
+ * v2.1：去掉摇一摇解锁；解锁框加「获取 UDID」（Safari 装描述文件 → 回来自动填入）；
+ *       拉源时读 X-AltStore-Device-State，换网络被拦（foreign/ip）自动打开首页改绑再重试。
  * v2.0：按钮/面板改名「八区软件源」；面板正文换成免责声明 + 设备 UID / 当前 IP / 会员到期 /
  *       站内应用数 / 本次更新 / 数据刷新 / QQ 群；解锁成功弹窗去掉源地址块与「复制源地址」按钮，
  *       UDID 提到到期时间上方；去掉「复制专属源地址（带 UDID）」菜单项。
@@ -29,12 +32,13 @@ static NSString *const kDefaultSourceURL = @"https://app.baqu.net/altstore.php/a
 static NSString *const kDefaultAPIURL    = @"https://app.baqu.net/api.php";
 static NSString *const kDefaultAPIKey    = @"";   // 后台「API密钥」为空就留空；填了则必须一致
 static NSTimeInterval const kCheckInterval = 1800.0;
-static BOOL const kEnableShakeUnlock  = YES;
 static BOOL const kEnableFloatButton  = YES;   // 常驻悬浮设置按钮
 static NSString *const kButtonHiddenKey = @"lcua_float_hidden";
 static NSString *const kAppTitle        = @"八区软件源";   // 按钮 + 面板标题
 static NSString *const kQQGroup         = @"565911547";
 static NSString *const kBuyURL          = @"https://store.baqu.net/";   // 「购买软件源」跳这里
+// 取 UDID 的请求伪装成 iPhone Safari，减少被 CDN 挑战拦掉的概率
+static NSString *const kSafariUA = @"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 // ------------------------------------------
 
 // observer 必须强引用持有
@@ -133,6 +137,23 @@ static NSString *LCSourceURLWithUDID(NSString *udid) {
 static NSString *LCStripQuery(NSString *u) {
     NSRange r = [u rangeOfString:@"?"];
     return r.location == NSNotFound ? u : [u substringToIndex:r.location];
+}
+
+// 站点根地址（UDID 页 / 首页改绑都在这台主机上）
+static NSString *LCSiteBase(void) {
+    NSURL *u = [NSURL URLWithString:LCSourceURL()];
+    if (u.scheme.length && u.host.length) {
+        return [NSString stringWithFormat:@"%@://%@", u.scheme, u.host];
+    }
+    return @"https://app.baqu.net";
+}
+
+static void LCOpenURL(NSString *s) {
+    NSURL *u = [NSURL URLWithString:s];
+    if (!u) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:nil];
+    });
 }
 
 // ============ 面板统计信息（UID / IP / 到期 / 应用数 / 更新数 / 刷新时间）============
@@ -264,6 +285,12 @@ static NSString *LCStatsMessage(void) {
            (long)[appCnt integerValue], (long)[updCnt integerValue]]
         : @"本站现有应用：读取中…";
 
+    NSString *state = [ud stringForKey:@"lcua_dev_state"] ?: @"";
+    NSString *warn = @"";
+    if ([state isEqualToString:@"foreign"] || [state isEqualToString:@"mismatch"]) {
+        warn = @"\n⚠️ 当前网络与激活网络不一致，付费 App 暂未放行（插件会自动改绑一次）";
+    }
+
     return [NSString stringWithFormat:
         @"所有资源均来自网络公开分享，仅用于个人学习交流，严禁商用，违规后果自行承担，如有版权问题请联系我们下架！请勿使用本源安装、分发违规相关应用及文件，账号封禁与本软件源无关。\n"
         @"设备 UID：%@\n"
@@ -271,13 +298,13 @@ static NSString *LCStatsMessage(void) {
         @"会员到期时间：%@\n"
         @"%@\n"
         @"数据刷新：%@\n"
-        @"交流QQ群：【%@】",
+        @"交流QQ群：【%@】%@",
         udid.length ? udid : @"未解锁",
         ip.length ? ip : @"获取中…",
         expire.length ? expire : @"未解锁",
         appsLine,
         time.length ? time : LCFormatDate([NSDate date], @"yyyy-MM-dd HH:mm:ss"),
-        kQQGroup];
+        kQQGroup, warn];
 }
 
 static NSComparisonResult LCCompareVersion(NSString *a, NSString *b) {
@@ -444,19 +471,74 @@ static void LCOpenSourceDeepLink(NSString *udidSrc) {
     });
 }
 
-// 后台刷新面板数据：源应用数/更新数 + 公网 IP + 会员到期
-static void LCRefreshStatsAsync(void) {
+// ---------- 专属源绑定：换网络被拦（foreign/ip）时自动改绑 ----------
+// 站点逻辑：设备第一次拉专属源 → 记下当时公网 IP 当 bind_ip；换网络后只有「先打开过站点首页」
+// （记录 touch_ip）再拉源才会重新绑定，否则只给免费应用。这里替用户把这一步自动做掉。
+static void LCFetchSourceJSON(BOOL allowRebind, void (^done)(NSArray *apps, BOOL unlocked, NSString *state));
+
+static void LCRebindCurrentNetwork(NSString *udid, void (^done)(void)) {
+    NSString *s = [NSString stringWithFormat:@"%@/?udid=%@", LCSiteBase(), LCURLEncode(udid)];
+    NSURL *u = [NSURL URLWithString:s];
+    if (!u) { done(); return; }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+    req.timeoutInterval = 20;
+    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    [req setValue:kSafariUA forHTTPHeaderField:@"User-Agent"];
+    // 首页只认 Cookie 里的 UDID 才记 touch_ip，URL 参数只是让页面判定「本机已解锁」
+    [req setValue:[NSString stringWithFormat:@"dx_local_udid=%@", udid] forHTTPHeaderField:@"Cookie"];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        done();
+    }] resume];
+}
+
+static void LCFetchSourceJSON(BOOL allowRebind, void (^done)(NSArray *apps, BOOL unlocked, NSString *state)) {
     NSString *udid = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_last_udid"] ?: @"";
     NSURL *url = [NSURL URLWithString:LCSourceURLWithUDID(udid)];
-    if (url) {
-        [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-            if (err || !data.length) return;
+    if (!url) { done(nil, NO, @""); return; }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.timeoutInterval = 20;
+    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSHTTPURLResponse *http = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)resp : nil;
+        NSString *state = [[http.allHeaderFields objectForKey:@"X-AltStore-Device-State"] description] ?: @"";
+        BOOL unlocked = [[[http.allHeaderFields objectForKey:@"X-AltStore-Unlocked"] description] isEqualToString:@"1"];
+
+        NSArray *apps = nil;
+        if (!err && data.length) {
             id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            if (![obj isKindOfClass:[NSDictionary class]]) return;
-            NSArray *apps = ((NSDictionary *)obj)[@"apps"];
-            if ([apps isKindOfClass:[NSArray class]]) LCRecordSourceStats(apps);
-        }] resume];
-    }
+            if ([obj isKindOfClass:[NSDictionary class]]) {
+                id a = ((NSDictionary *)obj)[@"apps"];
+                if ([a isKindOfClass:[NSArray class]]) apps = (NSArray *)a;
+            }
+        }
+
+        BOOL blocked = !unlocked && (state.length == 0
+                                     || [state isEqualToString:@"foreign"]
+                                     || [state isEqualToString:@"mismatch"]);
+        if (!allowRebind || !blocked || udid.length == 0) { done(apps, unlocked, state); return; }
+
+        // 改绑后重拉一次（只重试一次，避免死循环）
+        LCRebindCurrentNetwork(udid, ^{ LCFetchSourceJSON(NO, done); });
+    }] resume];
+}
+
+// 后台刷新面板数据：源应用数/更新数 + 公网 IP + 会员到期（换网时顺带改绑）
+static void LCRefreshStatsAsync(void) {
+    NSString *udid = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_last_udid"] ?: @"";
+    LCFetchSourceJSON(YES, ^(NSArray *apps, BOOL unlocked, NSString *state) {
+        if (![apps isKindOfClass:[NSArray class]]) return;
+        LCRecordSourceStats(apps);
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud setObject:(state.length ? state : (unlocked ? @"ok" : @"")) forKey:@"lcua_dev_state"];
+        [ud setBool:unlocked forKey:@"lcua_source_unlocked"];
+        [ud synchronize];
+        if (unlocked) {
+            // 改绑成功后把缓存刷成「含付费应用」的版本，下次进源页直接有
+            NSString *u = [ud stringForKey:@"lcua_last_udid"] ?: @"";
+            LCWarmSourceCache(LCSourceURLWithUDID(u));
+        }
+    });
     LCFetchClientIP();
     if (udid.length == 0) return;
     LCAPICall(@"validate", @{@"device_id": udid}, ^(NSDictionary *res, NSString *err) {
@@ -488,28 +570,48 @@ static void LCUnlockSuccess(NSString *udid, NSString *expire, NSString *note) {
         if (!existed) LCOpenSourceDeepLink(udidSrc);
     }
 
-    NSString *tail;
-    if (!isLC) {
-        tail = @"当前不在 LiveContainer 本体里，请到「源」页右上角手动添加这个地址：";
-    } else if (existed) {
-        tail = @"这个源已经在「软件源」列表里了，切到「源」页下拉刷新即可。";
-    } else {
-        tail = @"已自动导入到「软件源」，切到「源」页就能看到付费 App。\n若列表没变，重启一次 LiveContainer 即可。";
-    }
-    if (!isLC) tail = [tail stringByAppendingFormat:@"\n%@", udidSrc];
+    BOOL needCheck = isLC;
 
-    NSMutableArray *lines = [NSMutableArray array];
-    if (note.length) [lines addObject:note];
-    [lines addObject:[NSString stringWithFormat:@"UDID：%@", udid]];
-    if (expire.length) {
-        [lines addObject:[NSString stringWithFormat:@"到期：%@", expire]];
-        NSInteger left = LCDaysLeftOf(expire);
-        if (left >= 0) [lines addObject:[NSString stringWithFormat:@"剩余：%ld 天", (long)left]];
-    }
-    NSString *msg = [NSString stringWithFormat:@"%@\n\n%@", [lines componentsJoinedByString:@"\n"], tail];
-    LCShowAlert(@"解锁成功", msg, @[
-        [UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]
-    ]);
+    // 拉一次带 udid 的源，顺便确认付费应用是否真的放行（换网会被拦，这里会自动改绑并重试）
+    void (^finish)(NSArray *, BOOL, NSString *) = ^(NSArray *apps, BOOL unlocked, NSString *state) {
+        if ([apps isKindOfClass:[NSArray class]]) {
+            LCRecordSourceStats(apps);
+            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+            [d setObject:(state.length ? state : (unlocked ? @"ok" : @"")) forKey:@"lcua_dev_state"];
+            [d setBool:unlocked forKey:@"lcua_source_unlocked"];
+            [d synchronize];
+        }
+
+        NSString *tail;
+        if (!isLC) {
+            tail = [NSString stringWithFormat:@"当前不在 LiveContainer 本体里，请到「源」页右上角手动添加这个地址：\n%@", udidSrc];
+        } else if (!needCheck || unlocked) {
+            tail = existed
+                ? @"这个源已经在「软件源」列表里了，切到「源」页下拉刷新即可看到付费 App。"
+                : @"已自动导入到「软件源」，切到「源」页就能看到付费 App。\n若列表没变，重启一次 LiveContainer 即可。";
+        } else {
+            tail = [NSString stringWithFormat:
+                @"源已导入，但当前网络与激活时的网络不一致，付费 App 暂未放行（已自动尝试改绑）。\n\n"
+                @"若「源」页仍只有免费 App：用 Safari 打开 %@ 一次，再回「源」页下拉刷新；"
+                @"或在后台「设备管理 → 详情」解绑本机后刷新。", LCSiteBase()];
+        }
+
+        NSMutableArray *lines = [NSMutableArray array];
+        if (note.length) [lines addObject:note];
+        [lines addObject:[NSString stringWithFormat:@"UDID：%@", udid]];
+        if (expire.length) {
+            [lines addObject:[NSString stringWithFormat:@"到期：%@", expire]];
+            NSInteger left = LCDaysLeftOf(expire);
+            if (left >= 0) [lines addObject:[NSString stringWithFormat:@"剩余：%ld 天", (long)left]];
+        }
+        NSString *msg = [NSString stringWithFormat:@"%@\n\n%@", [lines componentsJoinedByString:@"\n"], tail];
+        LCShowAlert(@"解锁成功", msg, @[
+            [UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]
+        ]);
+    };
+
+    if (needCheck) LCFetchSourceJSON(YES, finish);
+    else finish(nil, NO, @"");
 
     // 顺手刷新面板要显示的 IP / 统计
     LCFetchClientIP();
@@ -582,12 +684,17 @@ static void LCUnlock(NSString *card, NSString *udid) {
     else LCQueryCard(card);
 }
 
+static NSString *lcUnlockHint = nil;            // 下次打开解锁框时的额外提示（如「已自动填入 UDID」）
+static void LCConfirmUDIDFetch(void);           // 定义在下面
+
 static void LCShowUnlockDialog(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_last_udid"] ?: @"";
+        NSMutableString *msg = [NSMutableString string];
+        if (lcUnlockHint.length) { [msg appendFormat:@"%@\n\n", lcUnlockHint]; lcUnlockHint = nil; }
+        [msg appendString:@"已激活未过期的：只填卡密 或 只填 UDID 即可。\n新卡首次激活：两个都填。\nUDID 可点下面「获取本机 UDID」自动填。"];
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"卡密解锁"
-            message:@"已激活未过期的：只填卡密 或 只填 UDID 即可。\n新卡首次激活：两个都填。\nUDID 需用 Safari 装描述文件获取。"
-            preferredStyle:UIAlertControllerStyleAlert];
+            message:msg preferredStyle:UIAlertControllerStyleAlert];
 
         [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
             tf.placeholder = @"卡密（已激活的填这个即可）";
@@ -604,6 +711,9 @@ static void LCShowUnlockDialog(void) {
             NSURL *buy = [NSURL URLWithString:kBuyURL];
             if (buy) [[UIApplication sharedApplication] openURL:buy options:@{} completionHandler:nil];
         }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"获取本机 UDID（跳 Safari）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            LCConfirmUDIDFetch();
+        }]];
         [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         [alert addAction:[UIAlertAction actionWithTitle:@"解锁" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             NSString *card = alert.textFields.count > 0 ? alert.textFields[0].text : @"";
@@ -612,6 +722,117 @@ static void LCShowUnlockDialog(void) {
         }]];
         LCPresent(alert, 4);
     });
+}
+
+// ============ 一键获取 UDID（Safari 装描述文件 → 回来自动填入）============
+// 站点 udid.php 的流程：落地页生成一次性令牌 → 打开 ?action=profile&t=令牌 下载描述文件 →
+// 用户装完 iOS 会把设备属性 POST 回 ?action=callback&t=令牌 → ?action=result&t=令牌 能取到 UDID。
+// 这里由插件自己取令牌，于是回到 App 后能直接把 UDID 抓回来填上（令牌与浏览器会话无关，只认文件）。
+static NSString *LCUDIDPageURL(void) { return [LCSiteBase() stringByAppendingString:@"/udid.php"]; }
+
+// 落地页 HTML 里带着令牌：profile / result 两个地址都用它（& 被转义成 \u0026 或 &amp;）
+static NSString *LCUDIDTokenFromHTML(NSString *html) {
+    if (html.length == 0) return nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+        @"action=profile(?:\\\\u0026|&amp;|&)t=([a-f0-9]{16,64})"
+        options:NSRegularExpressionCaseInsensitive error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:html options:0 range:NSMakeRange(0, html.length)];
+    if (!m || m.numberOfRanges < 2) return nil;
+    return [html substringWithRange:[m rangeAtIndex:1]];
+}
+
+static NSInteger lcUdidPollLeft = 0;
+
+static void LCUDIDFetched(NSString *udid) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setObject:udid forKey:@"lcua_last_udid"];
+    [ud removeObjectForKey:@"lcua_udid_token"];
+    [ud synchronize];
+    lcUdidPollLeft = 0;
+    lcUnlockHint = [NSString stringWithFormat:@"已自动填入本机 UDID：%@\n确认无误后点「解锁」。", udid];
+    LCShowUnlockDialog();
+}
+
+static void LCPollUDIDResult(void) {
+    NSString *token = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_udid_token"];
+    if (token.length == 0) return;
+    NSString *s = [NSString stringWithFormat:@"%@?action=result&t=%@", LCUDIDPageURL(), token];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:s]];
+    req.timeoutInterval = 15;
+    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSString *udid = nil;
+        if (!err && data.length) {
+            id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if ([obj isKindOfClass:[NSDictionary class]]) {
+                id v = ((NSDictionary *)obj)[@"udid"];
+                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) udid = (NSString *)v;
+            }
+        }
+        if (udid.length) { LCUDIDFetched(udid); return; }
+        if (lcUdidPollLeft <= 0) return;
+        lcUdidPollLeft--;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            LCPollUDIDResult();
+        });
+    }] resume];
+}
+
+// 从 Safari 回来：还在等就直接续上轮询（令牌 10 分钟内有效）
+static void LCResumeUDIDPollIfNeeded(void) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSString *token = [ud stringForKey:@"lcua_udid_token"];
+    if (token.length == 0) return;
+    NSTimeInterval ts = [[ud objectForKey:@"lcua_udid_ts"] doubleValue];
+    if (ts > 0 && ([[NSDate date] timeIntervalSince1970] - ts) > 600) {
+        [ud removeObjectForKey:@"lcua_udid_token"];
+        [ud synchronize];
+        return;
+    }
+    lcUdidPollLeft = 30;      // 最多再等约 60 秒
+    LCPollUDIDResult();
+}
+
+// 取令牌 + 直接用 Safari 打开描述文件下载地址
+static void LCStartUDIDFetch(void) {
+    NSURL *u = [NSURL URLWithString:LCUDIDPageURL()];
+    if (!u) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+    req.timeoutInterval = 20;
+    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    [req setValue:kSafariUA forHTTPHeaderField:@"User-Agent"];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSString *token = nil;
+        if (!err && data.length) {
+            token = LCUDIDTokenFromHTML([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
+        }
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        if (token.length) {
+            [ud setObject:token forKey:@"lcua_udid_token"];
+            [ud setObject:@([[NSDate date] timeIntervalSince1970]) forKey:@"lcua_udid_ts"];
+            [ud synchronize];
+            LCOpenURL([NSString stringWithFormat:@"%@?action=profile&t=%@", LCUDIDPageURL(), token]);
+        } else {
+            // 拿不到令牌就退回站点正常落地页，装完自己复制 UDID 粘贴
+            [ud removeObjectForKey:@"lcua_udid_token"];
+            [ud synchronize];
+            LCOpenURL(LCUDIDPageURL());
+        }
+    }] resume];
+}
+
+static void LCConfirmUDIDFetch(void) {
+    LCShowAlert(@"获取本机 UDID",
+        @"会用 Safari 打开本站 UDID 页并安装一个临时描述文件：\n"
+        @"1) 提示下载时点「允许」\n"
+        @"2) 打开 设置 → 已下载描述文件 → 安装\n"
+        @"3) 装完回到这里，UDID 会自动填入",
+        @[
+            [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil],
+            [UIAlertAction actionWithTitle:@"去获取" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                LCStartUDIDFetch();
+            }]
+        ]);
 }
 
 // ============ 顶部固定「八区软件源」按钮 ============
@@ -834,27 +1055,8 @@ static void LCShowSettingsMenu(void) {
 }
 
 // ============ 原生 runtime hook（不依赖 Logos / CydiaSubstrate）============
-// 摇一摇：给 UIApplication 加 motionBegan:withEvent: 的实现，保存父类原 IMP 并调用
-static IMP lcOrigMotionBegan = NULL;
-
-static void lcMotionBeganHook(id self, SEL _cmd, UIEventSubtype motion, UIEvent *event) {
-    if (lcOrigMotionBegan) {
-        ((void (*)(id, SEL, UIEventSubtype, UIEvent *))lcOrigMotionBegan)(self, _cmd, motion, event);
-    }
-    if (kEnableShakeUnlock && motion == UIEventSubtypeMotionShake) {
-        LCShowUnlockDialog();
-    }
-}
-
 __attribute__((constructor)) static void lcInit(void) {
     @autoreleasepool {
-        // 只 hook UIApplication 自己，不动 UIResponder 父类，避免影响所有响应者
-        Method parentMethod = class_getInstanceMethod([UIApplication class], @selector(motionBegan:withEvent:));
-        if (parentMethod) {
-            const char *types = method_getTypeEncoding(parentMethod);
-            lcOrigMotionBegan = method_getImplementation(parentMethod);
-            class_addMethod([UIApplication class], @selector(motionBegan:withEvent:), (IMP)lcMotionBeganHook, types);
-        }
         // 回前台通知
         lcNotificationObserver = [[NSNotificationCenter defaultCenter]
             addObserverForName:@"UIApplicationDidBecomeActiveNotification"
@@ -865,6 +1067,7 @@ __attribute__((constructor)) static void lcInit(void) {
                                dispatch_get_main_queue(), ^{
                     LCAttachFloatButton();
                     LCRunCheck();
+                    LCResumeUDIDPollIfNeeded();   // 从 Safari 装完描述文件回来，接着取 UDID
                 });
             }];
         // 每 0.5 秒检查一次当前 tab，源页显示、其它页隐藏（SwiftUI TabView 切换无通知）
