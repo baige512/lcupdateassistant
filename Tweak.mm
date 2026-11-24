@@ -29,6 +29,8 @@ static NSString *const kDefaultAPIKey    = @"";   // 后台「API密钥」为空
 static NSTimeInterval const kCheckInterval = 1800.0;
 static BOOL const kEnableFirstRunHint = YES;
 static BOOL const kEnableShakeUnlock  = YES;
+static BOOL const kEnableFloatButton  = YES;   // 常驻悬浮设置按钮
+static NSString *const kButtonHiddenKey = @"lcua_float_hidden";
 // ------------------------------------------
 
 // observer 必须强引用持有
@@ -277,6 +279,155 @@ static void LCShowUnlockDialog(void) {
     });
 }
 
+// ============ 常驻悬浮设置按钮 ============
+static UIView *lcFloatButton = nil;
+static NSString *const kButtonHiddenKey = @"lcua_float_hidden";
+static NSString *const kButtonXKey = @"lcua_btn_x";
+static NSString *const kButtonYKey = @"lcua_btn_y";   // 相对屏幕高度比例 0~1
+
+static void LCShowSettingsMenu(void);
+
+// 自定义按钮视图：自己处理拖动和点击（纯 ObjC，不依赖 Logos）
+@interface LCFloatButtonView : UIView
+@property (nonatomic, copy) void (^onTap)(void);
+@property (nonatomic, copy) void (^onMove)(CGFloat x, CGFloat yRatio);
+@end
+
+@implementation LCFloatButtonView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.layer.cornerRadius = frame.size.width / 2;
+    self.backgroundColor = [UIColor colorWithRed:0.36 green:0.24 blue:0.72 alpha:0.92];
+    self.layer.shadowColor = [UIColor blackColor].CGColor;
+    self.layer.shadowOpacity = 0.32;
+    self.layer.shadowRadius = 6;
+    self.layer.shadowOffset = CGSizeMake(0, 2);
+
+    UILabel *label = [[UILabel alloc] initWithFrame:self.bounds];
+    label.text = @"设置";
+    label.textColor = [UIColor whiteColor];
+    label.font = [UIFont boldSystemFontOfSize:14];
+    label.textAlignment = NSTextAlignmentCenter;
+    label.userInteractionEnabled = NO;
+    [self addSubview:label];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(lcTapped)];
+    [self addGestureRecognizer:tap];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(lcPanned:)];
+    [self addGestureRecognizer:pan];
+    return self;
+}
+
+- (void)lcTapped {
+    if (self.onTap) self.onTap();
+}
+
+- (void)lcPanned:(UIPanGestureRecognizer *)g {
+    UIWindow *win = self.window;
+    if (!win) return;
+    CGPoint p = [g translationInView:win];
+    CGPoint c = self.center;
+    c.x += p.x;
+    c.y += p.y;
+    c.x = MAX(28, MIN(c.x, win.bounds.size.width - 28));
+    c.y = MAX(80, MIN(c.y, win.bounds.size.height - 70));
+    self.center = c;
+    [g setTranslation:CGPointZero inView:win];
+    if (g.state == UIGestureRecognizerStateEnded && self.onMove) {
+        self.onMove(self.frame.origin.x, self.frame.origin.y / win.bounds.size.height);
+    }
+}
+@end
+
+static void LCPositionButton(UIView *btn) {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return;
+    CGSize ws = win.bounds.size;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    CGFloat x = [ud floatForKey:kButtonXKey];
+    CGFloat yRatio = [ud floatForKey:kButtonYKey];
+    if (x <= 0) x = ws.width - 66;          // 默认右侧
+    if (yRatio <= 0) yRatio = 0.42;          // 默认偏上
+    x = MAX(4, MIN(x, ws.width - 56));
+    CGFloat y = MAX(60, MIN(yRatio * ws.height, ws.height - 100));
+    btn.frame = CGRectMake(x, y, 52, 52);
+}
+
+static void LCHideFloatButton(void) {
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kButtonHiddenKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    if (lcFloatButton) [lcFloatButton removeFromSuperview];
+}
+
+static UIView *LCMakeFloatButton(void) {
+    return [[LCFloatButtonView alloc] initWithFrame:CGRectMake(0, 0, 52, 52)];
+}
+
+static void LCAttachFloatButton(void) {
+    if (!kEnableFloatButton) return;
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:kButtonHiddenKey]) return;
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ LCAttachFloatButton(); });
+        return;
+    }
+    if (lcFloatButton && lcFloatButton.superview == win) { LCPositionButton(lcFloatButton); return; }
+
+    LCFloatButtonView *btn = (LCFloatButtonView *)LCMakeFloatButton();
+    if (!lcFloatButton) lcFloatButton = btn;
+    [win addSubview:lcFloatButton];
+    LCPositionButton(lcFloatButton);
+
+    __weak UIView *weakBtn = lcFloatButton;
+    ((LCFloatButtonView *)lcFloatButton).onTap = ^{ LCShowSettingsMenu(); };
+    ((LCFloatButtonView *)lcFloatButton).onMove = ^(CGFloat x, CGFloat yRatio) {
+        UIView *b = weakBtn;
+        if (!b) return;
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud setFloat:x forKey:kButtonXKey];
+        [ud setFloat:yRatio forKey:kButtonYKey];
+        [ud synchronize];
+    };
+}
+
+static void LCShowSettingsMenu(void) {
+    NSString *src = LCSourceURL();
+    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"lcua_last_udid"] ?: @"";
+    NSString *u = src;
+    if (saved.length) {
+        u = ([src rangeOfString:@"?"].location == NSNotFound)
+            ? [src stringByAppendingFormat:@"?udid=%@", LCURLEncode(saved)]
+            : [src stringByAppendingFormat:@"&udid=%@", LCURLEncode(saved)];
+    }
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"LC 辅助设置"
+        message:[NSString stringWithFormat:@"源：%@\nUDID：%@", src, saved.length ? saved : @"未记录"]
+        preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"卡密解锁（输入卡密 + UDID）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        LCShowUnlockDialog();
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"复制专属源地址（带 UDID）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        LCCopy(u);
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"立即检查更新" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:LCKey(@"lcua_last_check")];
+        LCRunCheck();
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"隐藏此按钮" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        LCHideFloatButton();
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    sheet.popoverPresentationController.sourceView = lcFloatButton;
+    sheet.popoverPresentationController.sourceRect = lcFloatButton.bounds;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *top = LCTopVC();
+        if (top && !top.presentedViewController) [top presentViewController:sheet animated:YES completion:nil];
+    });
+}
+
 static void LCFirstRunHint(void) {
     if (!kEnableFirstRunHint) return;
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
@@ -321,6 +472,7 @@ __attribute__((constructor)) static void lcInit(void) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     LCFirstRunHint();
+                    LCAttachFloatButton();
                     LCRunCheck();
                 });
             }];
