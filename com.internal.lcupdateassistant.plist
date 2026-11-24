@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 软件源地址（apps.json） -->
+    <key>sourceURL</key>
+    <string>https://app.baqu.net/altstore.php/apps.json</string>
+
+    <!-- 激活接口：后台的 api.php -->
+    <key>apiURL</key>
+    <string>https://app.baqu.net/api.php</string>
+
+    <!-- 后台配置的 API 密钥；后台没配就留空字符串 -->
+    <key>apiKey</key>
+    <string></string>
+
+    <!-- 检查间隔（秒），最小 60，默认 1800 -->
+    <key>interval</key>
+    <integer>1800</integer>
+</dict>
+</plist>

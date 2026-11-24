@@ -1,0 +1,9 @@
+Package: com.internal.lcupdateassistant
+Name: LC Update Assistant
+Version: 1.2.0
+Architecture: iphoneos-arm
+Description: LiveContainer 软件源辅助：检测更新 + 摇一摇输入卡密/UDID 直接调 api.php 激活解锁。
+Maintainer: Internal
+Author: Internal
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.7100)
