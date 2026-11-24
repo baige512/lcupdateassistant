@@ -27,7 +27,7 @@ static NSString *const kDefaultSourceURL = @"https://app.baqu.net/altstore.php/a
 static NSString *const kDefaultAPIURL    = @"https://app.baqu.net/api.php";
 static NSString *const kDefaultAPIKey    = @"";   // 后台「API密钥」为空就留空；填了则必须一致
 static NSTimeInterval const kCheckInterval = 1800.0;
-static BOOL const kEnableFirstRunHint = YES;
+static BOOL const kEnableFirstRunHint = NO;   // 首次弹窗已关闭（太烦）
 static BOOL const kEnableShakeUnlock  = YES;
 static BOOL const kEnableFloatButton  = YES;   // 常驻悬浮设置按钮
 static NSString *const kButtonHiddenKey = @"lcua_float_hidden";
@@ -380,10 +380,25 @@ static UITabBarController *LCFindTabBar(UIViewController *vc) {
 }
 
 static BOOL LCIsLiveContainerApp(void) {
-    NSString *bid = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleIdentifier"] ?: @"";
-    // LiveContainer 本体 bundle id: com.kdt.livecontainer（可能带 team 后缀）
-    // guest App 的 mainBundle 被替换成客制 App 的 id，不会命中这里
-    return [bid rangeOfString:@"livecontainer"].location != NSNotFound;
+    NSBundle *main = [NSBundle mainBundle];
+    NSString *bid = [[main infoDictionary] objectForKey:@"CFBundleIdentifier"] ?: @"";
+    if ([bid rangeOfString:@"livecontainer"].location == NSNotFound) return NO;
+    // 关键：guest App 里 mainBundle 被 LiveContainer patch 成客制 App，
+    // 但 lcMainBundle 始终是宿主。本体里两者相同；不同则一定是 guest，直接否掉。
+    // LiveContainer 在 NSUserDefaults 上加了 +lcMainBundle category（私有 API）。
+    // 用 runtime 调，避免编译期找不到方法声明。
+    NSBundle *host = nil;
+    if ([NSUserDefaults respondsToSelector:NSSelectorFromString(@"lcMainBundle")]) {
+        @try {
+            IMP imp = [NSUserDefaults methodForSelector:NSSelectorFromString(@"lcMainBundle")];
+            host = ((NSBundle *(*)(id, SEL))imp)([NSUserDefaults class], NSSelectorFromString(@"lcMainBundle"));
+        } @catch (...) { host = nil; }
+    }
+    if (host && host != main) return NO;
+    // 再兜底：客制 App 的 mainBundle 若指向非 LiveContainer.app 路径也否掉
+    NSString *path = [main bundlePath] ?: @"";
+    if ([path rangeOfString:@"LiveContainer.app"].location == NSNotFound) return NO;
+    return YES;
 }
 
 static BOOL LCIsOnSourcesTab(void) {
@@ -468,6 +483,43 @@ static void LCHideFloatButton(void) {
     [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kButtonHiddenKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
     if (lcFloatButton) [lcFloatButton removeFromSuperview];
+}
+
+// -------- 双击「模块」页恢复被隐藏的按钮 --------
+static BOOL lcModulesDoubleTapFired = NO;
+
+@interface LCDoubleTapTarget : NSObject
+- (void)onDoubleTap;
+@end
+@implementation LCDoubleTapTarget
+- (void)onDoubleTap {
+    if (!LCIsLiveContainerApp()) return;
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    UITabBarController *tab = LCFindTabBar(win.rootViewController);
+    if (!tab || tab.selectedIndex != 2) return;   // 2 = 模块页
+    [[NSUserDefaults standardUserDefaults] setBool:NO forKey:kButtonHiddenKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    LCAttachFloatButton();
+    LCShowAlert(@"按钮已恢复", @"「激活软件源」按钮已重新显示在「源」页。",
+        @[[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]);
+}
+@end
+
+static LCDoubleTapTarget *lcDoubleTapTarget = nil;
+
+static void LCInstallDoubleTap(void) {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) { dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ LCInstallDoubleTap(); }); return; }
+    static char kLCDoubleTagKey;
+    for (UIGestureRecognizer *old in win.gestureRecognizers) {
+        if (objc_getAssociatedObject(old, &kLCDoubleTagKey)) return;   // 已装过
+    }
+    if (!lcDoubleTapTarget) lcDoubleTapTarget = [LCDoubleTapTarget new];
+    UITapGestureRecognizer *g = [[UITapGestureRecognizer alloc] initWithTarget:lcDoubleTapTarget action:@selector(onDoubleTap)];
+    g.numberOfTapsRequired = 2;
+    g.cancelsTouchesInView = NO;
+    objc_setAssociatedObject(g, &kLCDoubleTagKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [win addGestureRecognizer:g];
 }
 
 static void LCAttachFloatButton(void) {
@@ -573,7 +625,6 @@ __attribute__((constructor)) static void lcInit(void) {
             usingBlock:^(NSNotification *note) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
-                    LCFirstRunHint();
                     LCAttachFloatButton();
                     LCRunCheck();
                 });
@@ -581,8 +632,10 @@ __attribute__((constructor)) static void lcInit(void) {
         // 每 0.5 秒检查一次当前 tab，源页显示、其它页隐藏（SwiftUI TabView 切换无通知）
         // 延迟到下一个 runloop，确保主线程 runloop 已就绪
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            LCInstallDoubleTap();
             [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
                 LCAttachFloatButton();
+                LCInstallDoubleTap();
             }];
         });
     }
